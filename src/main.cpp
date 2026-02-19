@@ -14,7 +14,7 @@ void setup() {
   pixels.setBrightness(50);
   pixels.show();
 
-  
+  adc_attenuation_t
 
 }
 
