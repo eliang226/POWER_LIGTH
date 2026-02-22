@@ -3,39 +3,20 @@
 #include <PZEM004Tv30.h>
 #include <math.h>
 
-// =========================
-// Parte 1 + Parte 2 (Refactor)
-// =========================
-// Hardware objetivo: Seeed XIAO ESP32-C6 + NeoPixel + PZEM-004T v3.0
+#include <BatteryMonitor.h>
+#include <CurrentHallMonitor.h>
+#include <LedStatus.h>
+
 constexpr uint8_t kNeoPixelPin = D3;
 constexpr uint8_t kNumPixels = 1;
 constexpr uint8_t kPzemRxPin = D7;
 constexpr uint8_t kPzemTxPin = D6;
 constexpr uint8_t kBatteryAdcPin = D2;
+constexpr uint8_t kHallAdcPin = D1;
 
-constexpr uint32_t kPzemReadIntervalMs = 2000;
-constexpr uint32_t kBatteryReadIntervalMs = 250;
-constexpr uint32_t kBatteryPrintIntervalMs = 1000;
-constexpr uint8_t kFadeMin = 0;
-constexpr int8_t kFadeStep = 4;
-constexpr uint32_t kLowBatteryBlinkMs = 150;
-constexpr uint32_t kFloatFadeIntervalMs = 45;
-constexpr uint8_t kFloatFadeMax = 170;
-
-constexpr float kAdcReferenceV = 3.3f;
-constexpr uint16_t kAdcMaxCount = 4095;
-constexpr float kR1Ohm = 40200.0f;
-constexpr float kR2Ohm = 10000.0f;
-constexpr float kBatteryMinReportV = 5.0f;
-constexpr float kBatteryMaxSafeV = 16.5f;
-constexpr float kBatteryCalibrationScale = 1.05f;
-constexpr float kBatteryCalibrationOffsetV = 0.0f;
-constexpr float kBatteryEmaAlpha = 0.20f;
-constexpr uint8_t kBatterySamplesPerRead = 16;
-constexpr uint16_t kBatterySampleSettleUs = 200;
-constexpr float kLowBatteryTriggerV = 11.4f;
-constexpr float kLowBatteryClearV = 11.7f;
-constexpr uint8_t kLowBatteryConfirmReadings = 6;
+constexpr uint32_t kPzemReadIntervalMs = 2500;
+constexpr uint32_t kTelemetryPrintIntervalMs = 2500;
+constexpr float kKnownLoadCurrentA = 4.0f;
 
 struct PzemData {
   float voltage = NAN;
@@ -47,87 +28,33 @@ struct PzemData {
   bool valid = false;
 };
 
-enum class BatteryStatus : uint8_t {
-  BelowRange = 0,
-  InRange = 1,
-  OverRange = 2
-};
-
-struct BatteryData {
-  uint16_t raw = 0;
-  uint16_t adcMilliVolts = 0;
-  float adcVoltage = 0.0f;
-  float batteryVoltage = 0.0f;
-  float filteredBatteryVoltage = 0.0f;
-  BatteryStatus status = BatteryStatus::BelowRange;
-  uint8_t lowBatteryCounter = 0;
-  bool lowBatteryAlarm = false;
-  bool initialized = false;
-};
-
-enum class ChargeStage : uint8_t {
-  Equalize = 0,
-  BulkOrAbsorption = 1,
-  Float = 2,
-  RestFull = 3,
-  Discharging = 4,
-  LowBattery = 5,
-  Unknown = 6
-};
-
-ChargeStage evaluateChargeStage(float batteryVoltage, BatteryStatus rangeStatus, bool lowBatteryAlarm);
-const char* chargeStageText(ChargeStage stage);
-
 Adafruit_NeoPixel pixels(kNumPixels, kNeoPixelPin, NEO_GRB + NEO_KHZ800);
 HardwareSerial pzemSerial(1);
 PZEM004Tv30 pzem(pzemSerial, kPzemRxPin, kPzemTxPin);
+BatteryMonitor batteryMonitor(kBatteryAdcPin);
+LedStatus ledStatus(pixels);
 
-uint8_t gBrightness = kFadeMin;
-int8_t gFadeDirection = kFadeStep;
-uint32_t gLastFadeMs = 0;
 uint32_t gLastPzemReadMs = 0;
-uint32_t gLastBatteryReadMs = 0;
-uint32_t gLastBatteryPrintMs = 0;
-BatteryData gBattery;
-bool gLowBatteryBlinkOn = false;
-uint8_t gLastLedR = 0;
-uint8_t gLastLedG = 0;
-uint8_t gLastLedB = 0;
-bool gLedInitialized = false;
+uint32_t gLastTelemetryPrintMs = 0;
+PzemData gLastPzemData;
+bool gHasPzemSample = false;
 
-void setSolidColor(uint8_t r, uint8_t g, uint8_t b) {
-  if (gLedInitialized && r == gLastLedR && g == gLastLedG && b == gLastLedB) {
-    return;
-  }
-
-  gLastLedR = r;
-  gLastLedG = g;
-  gLastLedB = b;
-  gLedInitialized = true;
-
-  pixels.setPixelColor(0, pixels.Color(r, g, b));
-  pixels.show();
+HallMonitorConfig makeHallConfig() {
+  HallMonitorConfig config;
+  config.adcPin = kHallAdcPin;
+  config.resistorTopOhm = 27000.0f;     // R1
+  config.resistorBottomOhm = 4700.0f;   // R2
+  config.sensorCenterV = 2.5f;          // 2.5V typical center
+  config.sensorSpanV = 2.0f;            // 2.5 +/- 2V from vendor listing
+  config.fullScaleCurrentA = 100.0f;    // Confirmed model: 100A
+  config.bidirectional = true;          // Use false if you only need one direction
+  config.samplesPerRead = 16;
+  config.settleUs = 150;
+  config.emaAlpha = 0.20f;
+  return config;
 }
 
-void colorTestSequence() {
-  setSolidColor(255, 0, 0);
-  delay(700);
-  setSolidColor(0, 255, 0);
-  delay(700);
-  setSolidColor(0, 0, 255);
-  delay(700);
-  setSolidColor(0, 0, 0);
-  delay(400);
-}
-
-void blinkWhite(uint8_t times, uint16_t onMs, uint16_t offMs) {
-  for (uint8_t i = 0; i < times; i++) {
-    setSolidColor(255, 255, 255);
-    delay(onMs);
-    setSolidColor(0, 0, 0);
-    delay(offMs);
-  }
-}
+CurrentHallMonitor hallCurrentMonitor(makeHallConfig());
 
 PzemData readPzem() {
   PzemData data;
@@ -139,292 +66,97 @@ PzemData readPzem() {
   data.frequency = pzem.frequency();
   data.pf = pzem.pf();
 
-  data.valid = !isnan(data.voltage) &&
-               !isnan(data.current) &&
-               !isnan(data.power) &&
-               !isnan(data.energy) &&
-               !isnan(data.frequency) &&
-               !isnan(data.pf);
+  data.valid = !isnan(data.voltage) && !isnan(data.current) && !isnan(data.power) &&
+               !isnan(data.energy) && !isnan(data.frequency) && !isnan(data.pf);
 
   return data;
 }
 
-void printPzem(const PzemData& data) {
-  if (!data.valid) {
-    Serial.println("PZEM: lectura invalida (NaN). Revisa RX/TX, GND comun y alimentacion.");
+void updatePzem(uint32_t nowMs) {
+  if (nowMs - gLastPzemReadMs < kPzemReadIntervalMs) {
     return;
   }
+  gLastPzemReadMs = nowMs;
 
-  Serial.printf("PZEM -> V: %.1fV | I: %.3fA | P: %.1fW | E: %.3fkWh | F: %.1fHz | PF: %.2f\n",
-                data.voltage, data.current, data.power, data.energy, data.frequency, data.pf);
+  gLastPzemData = readPzem();
+  gHasPzemSample = true;
 }
 
-void updatePzem() {
-  const uint32_t now = millis();
-  if (now - gLastPzemReadMs < kPzemReadIntervalMs) {
+void printTelemetryJson(uint32_t nowMs) {
+  if (nowMs - gLastTelemetryPrintMs < kTelemetryPrintIntervalMs) {
     return;
   }
-  gLastPzemReadMs = now;
+  gLastTelemetryPrintMs = nowMs;
 
-  const PzemData data = readPzem();
-  printPzem(data);
-}
+  const BatteryData& battery = batteryMonitor.data();
+  const HallCurrentData& current = hallCurrentMonitor.data();
+  const char* batteryStatus = BatteryMonitor::rangeStatusText(battery.status);
+  const bool pzemValid = gHasPzemSample && gLastPzemData.valid;
 
-struct BatteryAdcAverages {
-  uint16_t raw = 0;
-  uint16_t milliVolts = 0;
-};
+  Serial.println();
+  Serial.println("============ TELEMETRIA ============");
+  Serial.print("t(ms): ");
+  Serial.print(nowMs);
+  Serial.println();
 
-BatteryAdcAverages readBatteryAverages() {
-  uint32_t rawSum = 0;
-  uint32_t milliVoltsSum = 0;
-
-  for (uint8_t i = 0; i < kBatterySamplesPerRead; ++i) {
-    (void)analogRead(kBatteryAdcPin);
-    delayMicroseconds(kBatterySampleSettleUs);
-    rawSum += analogRead(kBatteryAdcPin);
-    milliVoltsSum += analogReadMilliVolts(kBatteryAdcPin);
-  }
-
-  return {
-    static_cast<uint16_t>(rawSum / kBatterySamplesPerRead),
-    static_cast<uint16_t>(milliVoltsSum / kBatterySamplesPerRead)
-  };
-}
-
-float rawToAdcVoltage(uint16_t raw) {
-  return (static_cast<float>(raw) * kAdcReferenceV) / static_cast<float>(kAdcMaxCount);
-}
-
-float adcToBatteryVoltage(float adcVoltage) {
-  const float dividerGain = (kR1Ohm + kR2Ohm) / kR2Ohm;
-  const float batteryVoltage = adcVoltage * dividerGain;
-  return (batteryVoltage * kBatteryCalibrationScale) + kBatteryCalibrationOffsetV;
-}
-
-BatteryStatus evaluateBatteryStatus(float batteryVoltage) {
-  if (batteryVoltage > kBatteryMaxSafeV) {
-    return BatteryStatus::OverRange;
-  }
-  if (batteryVoltage < kBatteryMinReportV) {
-    return BatteryStatus::BelowRange;
-  }
-  return BatteryStatus::InRange;
-}
-
-const char* batteryRangeStatusText(BatteryStatus status) {
-  switch (status) {
-    case BatteryStatus::BelowRange:
-      return "BELOW_RANGE";
-    case BatteryStatus::InRange:
-      return "IN_RANGE";
-    case BatteryStatus::OverRange:
-      return "OVER_RANGE";
-    default:
-      return "UNKNOWN";
-  }
-}
-
-const char* batterySocStatusText(float batteryVoltage) {
-  // Tabla aproximada para plomo-acido 12V en reposo (OCV, ~25C):
-  // 100%=12.73, 90%=12.62, 80%=12.50, 70%=12.37, 60%=12.27,
-  // 50%=12.10, 40%=11.96, 30%=11.81, 20%=11.66, 10%=11.51.
-  if (batteryVoltage >= 12.73f) return "SOC_100";
-  if (batteryVoltage >= 12.62f) return "SOC_90";
-  if (batteryVoltage >= 12.50f) return "SOC_80";
-  if (batteryVoltage >= 12.37f) return "SOC_70";
-  if (batteryVoltage >= 12.27f) return "SOC_60";
-  if (batteryVoltage >= 12.10f) return "SOC_50";
-  if (batteryVoltage >= 11.96f) return "SOC_40";
-  if (batteryVoltage >= 11.81f) return "SOC_30";
-  if (batteryVoltage >= 11.66f) return "SOC_20";
-  if (batteryVoltage >= 11.51f) return "SOC_10";
-  return "SOC_0";
-}
-
-ChargeStage evaluateChargeStage(float batteryVoltage, BatteryStatus rangeStatus, bool lowBatteryAlarm) {
-  if (rangeStatus != BatteryStatus::InRange) return ChargeStage::Unknown;
-  if (lowBatteryAlarm) return ChargeStage::LowBattery;
-  if (batteryVoltage >= 15.0f) return ChargeStage::Equalize;
-  if (batteryVoltage >= 14.2f) return ChargeStage::BulkOrAbsorption;
-  if (batteryVoltage >= 13.2f) return ChargeStage::Float;
-  if (batteryVoltage >= 12.7f) return ChargeStage::RestFull;
-  return ChargeStage::Discharging;
-}
-
-const char* chargeStageText(ChargeStage stage) {
-  switch (stage) {
-    case ChargeStage::Equalize:
-      return "EQUALIZE";
-    case ChargeStage::BulkOrAbsorption:
-      return "BULK_OR_ABSORPTION";
-    case ChargeStage::Float:
-      return "FLOAT";
-    case ChargeStage::RestFull:
-      return "REST_FULL";
-    case ChargeStage::Discharging:
-      return "DISCHARGING";
-    case ChargeStage::LowBattery:
-      return "LOW_BATTERY";
-    default:
-      return "N/A";
-  }
-}
-
-void updateLedEffect() {
-  const uint32_t now = millis();
-  const ChargeStage stage = evaluateChargeStage(gBattery.filteredBatteryVoltage, gBattery.status, gBattery.lowBatteryAlarm);
-
-  // LOW_BATTERY: parpadeo rapido rojo.
-  if (stage == ChargeStage::LowBattery) {
-    if (now - gLastFadeMs >= kLowBatteryBlinkMs) {
-      gLastFadeMs = now;
-      gLowBatteryBlinkOn = !gLowBatteryBlinkOn;
-    }
-    setSolidColor(gLowBatteryBlinkOn ? 255 : 0, 0, 0);
-    return;
-  }
-
-  // BULK/ABSORPTION: doble pulso naranja.
-  if (stage == ChargeStage::BulkOrAbsorption) {
-    const uint16_t t = static_cast<uint16_t>(now % 900);
-    const bool pulseOn = (t < 100) || (t >= 220 && t < 320);
-    setSolidColor(pulseOn ? 255 : 0, pulseOn ? 120 : 0, 0);
-    return;
-  }
-
-  // FLOAT: respiracion lenta verde.
-  if (stage == ChargeStage::Float) {
-    if (now - gLastFadeMs >= kFloatFadeIntervalMs) {
-      gLastFadeMs = now;
-      int16_t nextBrightness = static_cast<int16_t>(gBrightness) + gFadeDirection;
-      if (nextBrightness >= kFloatFadeMax) {
-        nextBrightness = kFloatFadeMax;
-        gFadeDirection = -kFadeStep;
-      } else if (nextBrightness <= kFadeMin) {
-        nextBrightness = kFadeMin;
-        gFadeDirection = kFadeStep;
-      }
-      gBrightness = static_cast<uint8_t>(nextBrightness);
-    }
-    setSolidColor(0, gBrightness, 0);
-    return;
-  }
-
-  // Resto de estados: color solido.
-  switch (stage) {
-    case ChargeStage::Equalize:
-      setSolidColor(255, 0, 255);
-      break;
-    case ChargeStage::RestFull:
-      setSolidColor(0, 180, 255);
-      break;
-    case ChargeStage::Discharging:
-      setSolidColor(0, 0, 255);
-      break;
-    default:
-      if (gBattery.status == BatteryStatus::OverRange) {
-        setSolidColor(255, 0, 255);
-      } else {
-        setSolidColor(0, 0, 80);
-      }
-      break;
-  }
-}
-
-void updateBattery() {
-  const uint32_t now = millis();
-  if (now - gLastBatteryReadMs < kBatteryReadIntervalMs) {
-    return;
-  }
-  gLastBatteryReadMs = now;
-
-  const BatteryAdcAverages averages = readBatteryAverages();
-  gBattery.raw = averages.raw;
-  gBattery.adcMilliVolts = averages.milliVolts;
-  if (gBattery.adcMilliVolts > 0) {
-    gBattery.adcVoltage = static_cast<float>(gBattery.adcMilliVolts) / 1000.0f;
+  if (pzemValid) {
+    Serial.printf("PZEM: V=%.2fV | I=%.3fA | P=%.1fW | E=%.3fkWh | F=%.1fHz | PF=%.2f\n",
+                  gLastPzemData.voltage,
+                  gLastPzemData.current,
+                  gLastPzemData.power,
+                  gLastPzemData.energy,
+                  gLastPzemData.frequency,
+                  gLastPzemData.pf);
   } else {
-    gBattery.adcVoltage = rawToAdcVoltage(gBattery.raw);
-  }
-  gBattery.batteryVoltage = adcToBatteryVoltage(gBattery.adcVoltage);
-  gBattery.status = evaluateBatteryStatus(gBattery.batteryVoltage);
-
-  if (!gBattery.initialized) {
-    gBattery.filteredBatteryVoltage = gBattery.batteryVoltage;
-    gBattery.initialized = true;
-  } else {
-    gBattery.filteredBatteryVoltage =
-      (kBatteryEmaAlpha * gBattery.batteryVoltage) +
-      ((1.0f - kBatteryEmaAlpha) * gBattery.filteredBatteryVoltage);
+    Serial.println("PZEM: lectura invalida");
   }
 
-  if (gBattery.filteredBatteryVoltage <= kLowBatteryTriggerV) {
-    if (gBattery.lowBatteryCounter < kLowBatteryConfirmReadings) {
-      gBattery.lowBatteryCounter++;
-    }
-    if (gBattery.lowBatteryCounter >= kLowBatteryConfirmReadings) {
-      gBattery.lowBatteryAlarm = true;
-    }
-  } else if (gBattery.filteredBatteryVoltage >= kLowBatteryClearV) {
-    gBattery.lowBatteryCounter = 0;
-    gBattery.lowBatteryAlarm = false;
-  }
-}
-
-void printBattery() {
-  const uint32_t now = millis();
-  if (now - gLastBatteryPrintMs < kBatteryPrintIntervalMs) {
-    return;
-  }
-  gLastBatteryPrintMs = now;
-
-  const char* rangeStatus = batteryRangeStatusText(gBattery.status);
-  const char* socStatus = "N/A";
-  const ChargeStage stage = evaluateChargeStage(gBattery.filteredBatteryVoltage, gBattery.status, gBattery.lowBatteryAlarm);
-  const char* chargeStage = chargeStageText(stage);
-  const char* lowBatteryStatus = gBattery.lowBatteryAlarm ? "LOW_BATT_ON" : "LOW_BATT_OFF";
-  if (gBattery.status == BatteryStatus::InRange) {
-    socStatus = batterySocStatusText(gBattery.filteredBatteryVoltage);
-  }
-
-  Serial.printf("BAT -> raw:%u | mV:%u | Vadc:%.3fV | Vbat:%.2fV | Vf:%.2fV | STATUS:%s | SOC:%s | CHG_STAGE:%s | ALARM:%s | LBC:%u\n",
-                gBattery.raw,
-                gBattery.adcMilliVolts,
-                gBattery.adcVoltage,
-                gBattery.batteryVoltage,
-                gBattery.filteredBatteryVoltage,
-                rangeStatus,
-                socStatus,
-                chargeStage,
-                lowBatteryStatus,
-                gBattery.lowBatteryCounter);
+  Serial.print("BAT : V=");
+  Serial.print(battery.filteredBatteryVoltage, 2);
+  Serial.print("V | I=");
+  Serial.print(current.filteredCurrentA, 2);
+  Serial.print("A | HALL_mV=");
+  Serial.print(current.adcMilliVolts);
+  Serial.print("mV | GAIN=");
+  Serial.print(hallCurrentMonitor.currentGain(), 3);
+  Serial.print(" | STATUS=");
+  Serial.print(batteryStatus);
+  Serial.println();
+  Serial.println("====================================");
+  Serial.println();
 }
 
 void setup() {
   Serial.begin(115200);
 
-  pixels.begin();
-  pixels.setBrightness(40);
-  pixels.show();
-
   pzemSerial.begin(9600, SERIAL_8N1, kPzemRxPin, kPzemTxPin);
   Serial.println("Parte 2: lectura basica PZEM-004T v3.0");
   Serial.println("Parte 3: lectura de bateria por divisor resistivo en D2");
+  Serial.println("Parte 4: sensor Hall 100A en D1 + divisor R1=27k R2=4.7k");
 
-  analogReadResolution(12);
-  pinMode(kBatteryAdcPin, INPUT);
-#ifdef ADC_11db
-  analogSetPinAttenuation(kBatteryAdcPin, ADC_11db);
-#endif
-
-  colorTestSequence();
-  blinkWhite(2, 200, 200);
+  batteryMonitor.begin();
+  hallCurrentMonitor.begin();
+  Serial.println("Calibrando cero de corriente Hall, deja el conductor sin carga...");
+  hallCurrentMonitor.calibrateZero(250);
+  Serial.print("Calibrando ganancia Hall para carga conocida de ");
+  Serial.print(kKnownLoadCurrentA, 1);
+  Serial.println("A...");
+  if (hallCurrentMonitor.calibrateGainFromKnownCurrent(kKnownLoadCurrentA, 300)) {
+    Serial.print("Ganancia Hall ajustada a: ");
+    Serial.println(hallCurrentMonitor.currentGain(), 4);
+  } else {
+    Serial.println("No se pudo ajustar ganancia Hall (corriente medida muy baja).");
+  }
+  ledStatus.begin(40);
+  ledStatus.runStartupSequence();
 }
 
 void loop() {
-  updateLedEffect();
-  updatePzem();
-  updateBattery();
-  printBattery();
+  const uint32_t nowMs = millis();
+
+  batteryMonitor.update(nowMs);
+  hallCurrentMonitor.update(nowMs);
+  updatePzem(nowMs);
+  ledStatus.update(nowMs, batteryMonitor.chargeStage(), batteryMonitor.data().status);
+  printTelemetryJson(nowMs);
 }
