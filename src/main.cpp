@@ -90,8 +90,21 @@ uint32_t gLastBatteryReadMs = 0;
 uint32_t gLastBatteryPrintMs = 0;
 BatteryData gBattery;
 bool gLowBatteryBlinkOn = false;
+uint8_t gLastLedR = 0;
+uint8_t gLastLedG = 0;
+uint8_t gLastLedB = 0;
+bool gLedInitialized = false;
 
 void setSolidColor(uint8_t r, uint8_t g, uint8_t b) {
+  if (gLedInitialized && r == gLastLedR && g == gLastLedG && b == gLastLedB) {
+    return;
+  }
+
+  gLastLedR = r;
+  gLastLedG = g;
+  gLastLedB = b;
+  gLedInitialized = true;
+
   pixels.setPixelColor(0, pixels.Color(r, g, b));
   pixels.show();
 }
@@ -157,22 +170,26 @@ void updatePzem() {
   printPzem(data);
 }
 
-uint16_t readBatteryRawAverage() {
-  uint32_t sum = 0;
+struct BatteryAdcAverages {
+  uint16_t raw = 0;
+  uint16_t milliVolts = 0;
+};
+
+BatteryAdcAverages readBatteryAverages() {
+  uint32_t rawSum = 0;
+  uint32_t milliVoltsSum = 0;
+
   for (uint8_t i = 0; i < kBatterySamplesPerRead; ++i) {
     (void)analogRead(kBatteryAdcPin);
     delayMicroseconds(kBatterySampleSettleUs);
-    sum += analogRead(kBatteryAdcPin);
+    rawSum += analogRead(kBatteryAdcPin);
+    milliVoltsSum += analogReadMilliVolts(kBatteryAdcPin);
   }
-  return static_cast<uint16_t>(sum / kBatterySamplesPerRead);
-}
 
-uint16_t readBatteryMilliVoltsAverage() {
-  uint32_t sum = 0;
-  for (uint8_t i = 0; i < kBatterySamplesPerRead; ++i) {
-    sum += analogReadMilliVolts(kBatteryAdcPin);
-  }
-  return static_cast<uint16_t>(sum / kBatterySamplesPerRead);
+  return {
+    static_cast<uint16_t>(rawSum / kBatterySamplesPerRead),
+    static_cast<uint16_t>(milliVoltsSum / kBatterySamplesPerRead)
+  };
 }
 
 float rawToAdcVoltage(uint16_t raw) {
@@ -322,8 +339,9 @@ void updateBattery() {
   }
   gLastBatteryReadMs = now;
 
-  gBattery.raw = readBatteryRawAverage();
-  gBattery.adcMilliVolts = readBatteryMilliVoltsAverage();
+  const BatteryAdcAverages averages = readBatteryAverages();
+  gBattery.raw = averages.raw;
+  gBattery.adcMilliVolts = averages.milliVolts;
   if (gBattery.adcMilliVolts > 0) {
     gBattery.adcVoltage = static_cast<float>(gBattery.adcMilliVolts) / 1000.0f;
   } else {
