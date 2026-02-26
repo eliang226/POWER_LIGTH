@@ -16,7 +16,8 @@ constexpr uint8_t kHallAdcPin = D1;
 
 constexpr uint32_t kPzemReadIntervalMs = 2500;
 constexpr uint32_t kTelemetryPrintIntervalMs = 2500;
-constexpr float kKnownLoadCurrentA = 4.0f;
+constexpr float kKnownLoadCurrentA = 3.52f;
+constexpr float kMinHallCalibrationCurrentA = 3.0f;
 
 struct PzemData {
   float voltage = NAN;
@@ -38,6 +39,7 @@ uint32_t gLastPzemReadMs = 0;
 uint32_t gLastTelemetryPrintMs = 0;
 PzemData gLastPzemData;
 bool gHasPzemSample = false;
+String gSerialCommand;
 
 HallMonitorConfig makeHallConfig() {
   HallMonitorConfig config;
@@ -126,6 +128,84 @@ void printTelemetryJson(uint32_t nowMs) {
   Serial.println();
 }
 
+void printHallCommandHelp() {
+  Serial.println("Comandos Hall:");
+  Serial.println("  HALL ZERO");
+  Serial.println("  HALL GAIN <amps>   (>=3A, ej: HALL GAIN 4.2)");
+  Serial.println("  HALL STATUS");
+  Serial.println("  HALL HELP");
+}
+
+void processHallCommand(const String& rawCmd) {
+  String cmd = rawCmd;
+  cmd.trim();
+  cmd.toUpperCase();
+
+  if (cmd.length() == 0) {
+    return;
+  }
+
+  if (cmd == "HALL HELP") {
+    printHallCommandHelp();
+    return;
+  }
+
+  if (cmd == "HALL ZERO") {
+    Serial.println("Calibrando cero Hall... deja el conductor sin carga.");
+    hallCurrentMonitor.calibrateZero(250);
+    Serial.println("OK: cero Hall calibrado.");
+    return;
+  }
+
+  if (cmd == "HALL STATUS") {
+    Serial.print("Hall gain actual: ");
+    Serial.println(hallCurrentMonitor.currentGain(), 4);
+    return;
+  }
+
+  if (cmd.startsWith("HALL GAIN ")) {
+    const String valueText = cmd.substring(10);
+    const float knownA = valueText.toFloat();
+    if (knownA < kMinHallCalibrationCurrentA) {
+      Serial.print("ERROR: usa una carga de calibracion >=");
+      Serial.print(kMinHallCalibrationCurrentA, 1);
+      Serial.println("A.");
+      return;
+    }
+
+    Serial.print("Calibrando ganancia Hall con carga conocida de ");
+    Serial.print(knownA, 3);
+    Serial.println("A...");
+    if (hallCurrentMonitor.calibrateGainFromKnownCurrent(knownA, 300)) {
+      Serial.print("OK: nueva ganancia Hall = ");
+      Serial.println(hallCurrentMonitor.currentGain(), 4);
+    } else {
+      Serial.println("ERROR: no se pudo calibrar (corriente medida muy baja).");
+    }
+    return;
+  }
+
+  Serial.println("Comando no reconocido. Usa: HALL HELP");
+}
+
+void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      processHallCommand(gSerialCommand);
+      gSerialCommand = "";
+      continue;
+    }
+
+    if (gSerialCommand.length() < 80) {
+      gSerialCommand += c;
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -138,15 +218,22 @@ void setup() {
   hallCurrentMonitor.begin();
   Serial.println("Calibrando cero de corriente Hall, deja el conductor sin carga...");
   hallCurrentMonitor.calibrateZero(250);
-  Serial.print("Calibrando ganancia Hall para carga conocida de ");
-  Serial.print(kKnownLoadCurrentA, 1);
-  Serial.println("A...");
-  if (hallCurrentMonitor.calibrateGainFromKnownCurrent(kKnownLoadCurrentA, 300)) {
-    Serial.print("Ganancia Hall ajustada a: ");
-    Serial.println(hallCurrentMonitor.currentGain(), 4);
+  if (kKnownLoadCurrentA >= kMinHallCalibrationCurrentA) {
+    Serial.print("Calibrando ganancia Hall para carga conocida de ");
+    Serial.print(kKnownLoadCurrentA, 1);
+    Serial.println("A...");
+    if (hallCurrentMonitor.calibrateGainFromKnownCurrent(kKnownLoadCurrentA, 300)) {
+      Serial.print("Ganancia Hall ajustada a: ");
+      Serial.println(hallCurrentMonitor.currentGain(), 4);
+    } else {
+      Serial.println("No se pudo ajustar ganancia Hall (corriente medida muy baja).");
+    }
   } else {
-    Serial.println("No se pudo ajustar ganancia Hall (corriente medida muy baja).");
+    Serial.print("Calibracion de ganancia omitida: usar carga >=");
+    Serial.print(kMinHallCalibrationCurrentA, 1);
+    Serial.println("A.");
   }
+  printHallCommandHelp();
   ledStatus.begin(40);
   ledStatus.runStartupSequence();
 }
@@ -154,6 +241,7 @@ void setup() {
 void loop() {
   const uint32_t nowMs = millis();
 
+  handleSerialCommands();
   batteryMonitor.update(nowMs);
   hallCurrentMonitor.update(nowMs);
   updatePzem(nowMs);
