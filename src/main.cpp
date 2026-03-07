@@ -5,6 +5,7 @@
 #include <math.h>
 #include <string.h>
 #include <liquidcrystal_i2c.h>
+#include <AppBridge.h>
 #include <BatteryMonitor.h>
 #include <CurrentHallMonitor.h>
 #include <LedStatus.h>
@@ -51,6 +52,7 @@ PZEM004Tv30 pzem(pzemSerial, kPzemRxPin, kPzemTxPin);
 BatteryMonitor batteryMonitor(kBatteryAdcPin);
 LedStatus ledStatus(pixels);
 LiquidCrystal_I2C lcd(kLCD_I2cAddress, 16, 2);
+AppBridge appBridge;
 
 uint32_t gLastPzemReadMs = 0;
 uint32_t gLastPzemValidMs = 0;
@@ -141,6 +143,23 @@ uint8_t estimateBatteryCapacityPercent(float batteryVoltage) {
   }
   const float ratio = (batteryVoltage - vMin) / (vMax - vMin);
   return static_cast<uint8_t>(ratio * 100.0f + 0.5f);
+}
+
+AppTelemetry buildAppTelemetry(uint32_t nowMs) {
+  AppTelemetry telemetry;
+  const BatteryData& battery = batteryMonitor.data();
+  const HallCurrentData& current = hallCurrentMonitor.data();
+  const bool pzemValid = isPzemDataFresh(nowMs);
+
+  telemetry.line1AcPresent = gLine1AcPresent;
+  telemetry.pzemValid = pzemValid;
+  telemetry.pzemVoltage = pzemValid ? gLastPzemData.voltage : 0.0f;
+  telemetry.pzemCurrent = pzemValid ? gLastPzemData.current : 0.0f;
+  telemetry.pzemPower = pzemValid ? gLastPzemData.power : 0.0f;
+  telemetry.batteryVoltage = battery.filteredBatteryVoltage;
+  telemetry.batteryCurrent = current.filteredCurrentA;
+  telemetry.batteryCapacityPercent = estimateBatteryCapacityPercent(battery.filteredBatteryVoltage);
+  return telemetry;
 }
 
 void printTelemetryJson(uint32_t nowMs) {
@@ -388,10 +407,12 @@ void updateLine1Ac(uint32_t nowMs) {
       gLine1AlertType = Line1AlertType::PowerLost;
       gLine1AlertUntilMs = nowMs + kLine1AlertHoldMs;
       Serial.println("ALERTA: LINEA 1 SIN ELECTRICIDAD");
+      appBridge.publishAlert("LINE1_LOST", nowMs);
     } else {
       gLine1AlertType = Line1AlertType::PowerRestored;
       gLine1AlertUntilMs = nowMs + kLine1AlertHoldMs;
       Serial.println("INFO: LINEA 1 RESTABLECIDA");
+      appBridge.publishAlert("LINE1_RESTORED", nowMs);
     }
   }
 
@@ -442,6 +463,7 @@ void setup() {
   lcd.backlight();
   lcdBoot("POWER LIGHT V1", "Iniciando...", 1000);
   Serial.begin(115200);
+  appBridge.begin();
 
   pzemSerial.begin(9600, SERIAL_8N1, kPzemRxPin, kPzemTxPin);
   pinMode(kLine1AcPin, INPUT_PULLUP);
@@ -498,11 +520,13 @@ void setup() {
 void loop() {
   const uint32_t nowMs = millis();
 
+  appBridge.update(nowMs);
   handleSerialCommands();
   batteryMonitor.update(nowMs);
   hallCurrentMonitor.update(nowMs);
   updatePzem(nowMs);
   updateLine1Ac(nowMs);
+  appBridge.publishTelemetry(buildAppTelemetry(nowMs), nowMs);
   updateLcdDashboard(nowMs);
   ledStatus.update(nowMs, batteryMonitor.chargeStage(), batteryMonitor.data().status);
   printTelemetryJson(nowMs);
