@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <PZEM004Tv30.h>
+#include <ctype.h>
 #include <math.h>
-
+#include <string.h>
+#include <liquidcrystal_i2c.h>
 #include <BatteryMonitor.h>
 #include <CurrentHallMonitor.h>
 #include <LedStatus.h>
@@ -13,11 +15,19 @@ constexpr uint8_t kPzemRxPin = D7;
 constexpr uint8_t kPzemTxPin = D6;
 constexpr uint8_t kBatteryAdcPin = D2;
 constexpr uint8_t kHallAdcPin = D1;
-
+constexpr uint8_t kLine1AcPin = A0;  // H11AA: LOW means AC present
+constexpr uint8_t kLCD_I2cAddress = 0x27;
 constexpr uint32_t kPzemReadIntervalMs = 2500;
+constexpr uint32_t kPzemDataTimeoutMs = 10000;
 constexpr uint32_t kTelemetryPrintIntervalMs = 2500;
+constexpr uint32_t kLcdRotateIntervalMs = 5000;
+constexpr uint32_t kLine1AlertHoldMs = 7000;
+constexpr uint32_t kLine1AcEvalWindowMs = 250;
+constexpr uint16_t kLine1AcMinEdges = 6;
+constexpr uint16_t kLine1AcMinLowSamples = 3;
 constexpr float kKnownLoadCurrentA = 3.52f;
 constexpr float kMinHallCalibrationCurrentA = 3.0f;
+constexpr size_t kSerialCmdBufferSize = 96;
 
 struct PzemData {
   float voltage = NAN;
@@ -29,17 +39,43 @@ struct PzemData {
   bool valid = false;
 };
 
+enum class Line1AlertType : uint8_t {
+  None = 0,
+  PowerLost = 1,
+  PowerRestored = 2
+};
+
 Adafruit_NeoPixel pixels(kNumPixels, kNeoPixelPin, NEO_GRB + NEO_KHZ800);
 HardwareSerial pzemSerial(1);
 PZEM004Tv30 pzem(pzemSerial, kPzemRxPin, kPzemTxPin);
 BatteryMonitor batteryMonitor(kBatteryAdcPin);
 LedStatus ledStatus(pixels);
+LiquidCrystal_I2C lcd(kLCD_I2cAddress, 16, 2);
 
 uint32_t gLastPzemReadMs = 0;
+uint32_t gLastPzemValidMs = 0;
 uint32_t gLastTelemetryPrintMs = 0;
+uint32_t gLastLcdRotateMs = 0;
+uint32_t gLine1WindowStartMs = 0;
 PzemData gLastPzemData;
 bool gHasPzemSample = false;
-String gSerialCommand;
+bool gLcdRefreshRequested = true;
+bool gLine1AcPresent = false;
+bool gLine1AcInitialized = false;
+bool gAlertScreenVisible = false;
+uint8_t gLcdScreenIndex = 0;
+char gSerialCommand[kSerialCmdBufferSize] = {0};
+size_t gSerialCommandLen = 0;
+volatile uint16_t gLine1EdgeCountIsr = 0;
+uint16_t gLine1LowSamples = 0;
+uint32_t gLine1AlertUntilMs = 0;
+Line1AlertType gLine1AlertType = Line1AlertType::None;
+
+void IRAM_ATTR isrLine1Ac() {
+  if (gLine1EdgeCountIsr < UINT16_MAX) {
+    gLine1EdgeCountIsr = static_cast<uint16_t>(gLine1EdgeCountIsr + 1);
+  }
+}
 
 HallMonitorConfig makeHallConfig() {
   HallMonitorConfig config;
@@ -82,6 +118,29 @@ void updatePzem(uint32_t nowMs) {
 
   gLastPzemData = readPzem();
   gHasPzemSample = true;
+  if (gLastPzemData.valid) {
+    gLastPzemValidMs = nowMs;
+  }
+}
+
+bool isPzemDataFresh(uint32_t nowMs) {
+  return gHasPzemSample &&
+         gLastPzemData.valid &&
+         (nowMs - gLastPzemValidMs <= kPzemDataTimeoutMs);
+}
+
+uint8_t estimateBatteryCapacityPercent(float batteryVoltage) {
+  // Temporary approximation for 12V lead-acid profile; later this will come from app config.
+  const float vMin = 11.50f;
+  const float vMax = 12.73f;
+  if (!isfinite(batteryVoltage) || batteryVoltage <= vMin) {
+    return 0;
+  }
+  if (batteryVoltage >= vMax) {
+    return 100;
+  }
+  const float ratio = (batteryVoltage - vMin) / (vMax - vMin);
+  return static_cast<uint8_t>(ratio * 100.0f + 0.5f);
 }
 
 void printTelemetryJson(uint32_t nowMs) {
@@ -93,7 +152,7 @@ void printTelemetryJson(uint32_t nowMs) {
   const BatteryData& battery = batteryMonitor.data();
   const HallCurrentData& current = hallCurrentMonitor.data();
   const char* batteryStatus = BatteryMonitor::rangeStatusText(battery.status);
-  const bool pzemValid = gHasPzemSample && gLastPzemData.valid;
+  const bool pzemValid = isPzemDataFresh(nowMs);
 
   Serial.println();
   Serial.println("============ TELEMETRIA ============");
@@ -136,36 +195,71 @@ void printHallCommandHelp() {
   Serial.println("  HALL HELP");
 }
 
-void processHallCommand(const String& rawCmd) {
-  String cmd = rawCmd;
-  cmd.trim();
-  cmd.toUpperCase();
-
-  if (cmd.length() == 0) {
+void normalizeCommand(char* text) {
+  if (!text) {
     return;
   }
 
-  if (cmd == "HALL HELP") {
+  size_t len = strlen(text);
+  size_t start = 0;
+  while (start < len && isspace(static_cast<unsigned char>(text[start]))) {
+    start++;
+  }
+  if (start > 0) {
+    memmove(text, text + start, len - start + 1);
+    len -= start;
+  }
+
+  while (len > 0 && isspace(static_cast<unsigned char>(text[len - 1]))) {
+    text[--len] = '\0';
+  }
+
+  for (size_t i = 0; i < len; ++i) {
+    text[i] = static_cast<char>(toupper(static_cast<unsigned char>(text[i])));
+  }
+}
+
+void processHallCommand(const char* rawCmd) {
+  if (!rawCmd) {
+    return;
+  }
+
+  char cmd[kSerialCmdBufferSize];
+  strncpy(cmd, rawCmd, sizeof(cmd) - 1);
+  cmd[sizeof(cmd) - 1] = '\0';
+  normalizeCommand(cmd);
+
+  const size_t cmdLen = strlen(cmd);
+
+  if (cmdLen == 0) {
+    return;
+  }
+
+  if (strcmp(cmd, "HALL HELP") == 0) {
     printHallCommandHelp();
     return;
   }
 
-  if (cmd == "HALL ZERO") {
+  if (strcmp(cmd, "HALL ZERO") == 0) {
     Serial.println("Calibrando cero Hall... deja el conductor sin carga.");
     hallCurrentMonitor.calibrateZero(250);
     Serial.println("OK: cero Hall calibrado.");
     return;
   }
 
-  if (cmd == "HALL STATUS") {
+  if (strcmp(cmd, "HALL STATUS") == 0) {
     Serial.print("Hall gain actual: ");
     Serial.println(hallCurrentMonitor.currentGain(), 4);
     return;
   }
 
-  if (cmd.startsWith("HALL GAIN ")) {
-    const String valueText = cmd.substring(10);
-    const float knownA = valueText.toFloat();
+  if (strncmp(cmd, "HALL GAIN ", 10) == 0) {
+    char* endPtr = nullptr;
+    const float knownA = strtof(cmd + 10, &endPtr);
+    if (endPtr == (cmd + 10)) {
+      Serial.println("ERROR: valor invalido. Ejemplo: HALL GAIN 4.2");
+      return;
+    }
     if (knownA < kMinHallCalibrationCurrentA) {
       Serial.print("ERROR: usa una carga de calibracion >=");
       Serial.print(kMinHallCalibrationCurrentA, 1);
@@ -196,39 +290,187 @@ void handleSerialCommands() {
     }
     if (c == '\n') {
       processHallCommand(gSerialCommand);
-      gSerialCommand = "";
+      gSerialCommandLen = 0;
+      gSerialCommand[0] = '\0';
       continue;
     }
 
-    if (gSerialCommand.length() < 80) {
-      gSerialCommand += c;
+    if (gSerialCommandLen < (kSerialCmdBufferSize - 1)) {
+      gSerialCommand[gSerialCommandLen++] = c;
+      gSerialCommand[gSerialCommandLen] = '\0';
     }
   }
 }
 
+void lcdBoot(const char* line1, const char* line2 = "", uint16_t holdMs = 0) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+  if (holdMs > 0) {
+    delay(holdMs);
+  }
+}
+
+void lcdShowScreen(const char* line1, const char* line2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
+
+void renderLine1AlertScreen() {
+  if (gLine1AlertType == Line1AlertType::PowerLost) {
+    lcdShowScreen("ALERTA LINEA 1", "SIN ELECTRICIDAD");
+  } else if (gLine1AlertType == Line1AlertType::PowerRestored) {
+    lcdShowScreen("LINEA 1 ACTIVA", "ENERGIA VOLVIO");
+  }
+}
+
+void renderLcdScreen(uint8_t screenIndex, uint32_t nowMs) {
+  char line1[17] = {0};
+  char line2[17] = {0};
+  const BatteryData& battery = batteryMonitor.data();
+  const HallCurrentData& current = hallCurrentMonitor.data();
+  const bool pzemValid = isPzemDataFresh(nowMs);
+
+  switch (screenIndex) {
+    case 0:  // Pantalla 1: Estado AC + datos PZEM
+      if (pzemValid) {
+        snprintf(line1, sizeof(line1), "AC:%s V:%3.0fV", gLine1AcPresent ? "LINE" : "OUT", gLastPzemData.voltage);
+        snprintf(line2, sizeof(line2), "A:%4.2f W:%4.0f", gLastPzemData.current, gLastPzemData.power);
+      } else {
+        snprintf(line1, sizeof(line1), "AC:%s V:---", gLine1AcPresent ? "LINE" : "OUT");
+        snprintf(line2, sizeof(line2), "A:--.-- W:----");
+      }
+      lcdShowScreen(line1, line2);
+      return;
+
+    case 1:  // Pantalla 2: Bateria
+      snprintf(line1, sizeof(line1), "VBat:%4.1fV A:%3.1f", battery.filteredBatteryVoltage, current.filteredCurrentA);
+      snprintf(line2, sizeof(line2), "Capacidad:%3u%%", estimateBatteryCapacityPercent(battery.filteredBatteryVoltage));
+      lcdShowScreen(line1, line2);
+      return;
+
+    default:
+      lcdShowScreen("Sistema", "Pantalla N/A");
+      return;
+  }
+}
+
+void updateLine1Ac(uint32_t nowMs) {
+  if (digitalRead(kLine1AcPin) == LOW && gLine1LowSamples < UINT16_MAX) {
+    gLine1LowSamples = static_cast<uint16_t>(gLine1LowSamples + 1);
+  }
+
+  if (nowMs - gLine1WindowStartMs < kLine1AcEvalWindowMs) {
+    return;
+  }
+
+  noInterrupts();
+  const uint16_t edgeCount = gLine1EdgeCountIsr;
+  gLine1EdgeCountIsr = 0;
+  interrupts();
+
+  const bool lowStateDetected = (gLine1LowSamples >= kLine1AcMinLowSamples);
+  const bool newLine1AcPresent = (edgeCount >= kLine1AcMinEdges) || lowStateDetected;
+  gLine1LowSamples = 0;
+
+  if (!gLine1AcInitialized) {
+    gLine1AcPresent = newLine1AcPresent;
+    gLine1AcInitialized = true;
+  } else if (newLine1AcPresent != gLine1AcPresent) {
+    gLine1AcPresent = newLine1AcPresent;
+    gLcdRefreshRequested = true;
+    if (!gLine1AcPresent) {
+      gLine1AlertType = Line1AlertType::PowerLost;
+      gLine1AlertUntilMs = nowMs + kLine1AlertHoldMs;
+      Serial.println("ALERTA: LINEA 1 SIN ELECTRICIDAD");
+    } else {
+      gLine1AlertType = Line1AlertType::PowerRestored;
+      gLine1AlertUntilMs = nowMs + kLine1AlertHoldMs;
+      Serial.println("INFO: LINEA 1 RESTABLECIDA");
+    }
+  }
+
+  gLine1WindowStartMs = nowMs;
+}
+
+void updateLcdDashboard(uint32_t nowMs) {
+  const bool alertActive =
+      (gLine1AlertType != Line1AlertType::None) &&
+      (static_cast<int32_t>(gLine1AlertUntilMs - nowMs) > 0);
+
+  if (alertActive) {
+    if (!gAlertScreenVisible || gLcdRefreshRequested) {
+      gLcdRefreshRequested = false;
+      renderLine1AlertScreen();
+    }
+    gAlertScreenVisible = true;
+    return;
+  }
+
+  if (gLine1AlertType != Line1AlertType::None) {
+    gLine1AlertType = Line1AlertType::None;
+  }
+  if (gAlertScreenVisible) {
+    gAlertScreenVisible = false;
+    gLcdRefreshRequested = true;
+    gLastLcdRotateMs = nowMs;
+  }
+
+  if (gLcdRefreshRequested) {
+    gLcdRefreshRequested = false;
+    gLastLcdRotateMs = nowMs;
+    renderLcdScreen(gLcdScreenIndex, nowMs);
+    return;
+  }
+
+  if (nowMs - gLastLcdRotateMs < kLcdRotateIntervalMs) {
+    return;
+  }
+
+  gLastLcdRotateMs = nowMs;
+  gLcdScreenIndex = (gLcdScreenIndex + 1) % 2;
+  renderLcdScreen(gLcdScreenIndex, nowMs);
+}
+
 void setup() {
+  lcd.init();
+  lcd.backlight();
+  lcdBoot("POWER LIGHT V1", "Iniciando...", 1000);
   Serial.begin(115200);
 
   pzemSerial.begin(9600, SERIAL_8N1, kPzemRxPin, kPzemTxPin);
+  pinMode(kLine1AcPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(kLine1AcPin), isrLine1Ac, CHANGE);
+  lcdBoot("Init sensores", "PZEM/Bat/Hall", 700);
   Serial.println("Parte 2: lectura basica PZEM-004T v3.0");
   Serial.println("Parte 3: lectura de bateria por divisor resistivo en D2");
   Serial.println("Parte 4: sensor Hall 100A en D1 + divisor R1=27k R2=4.7k");
 
   batteryMonitor.begin();
   hallCurrentMonitor.begin();
+  lcdBoot("Calibrando Hall", "Cero en curso");
   Serial.println("Calibrando cero de corriente Hall, deja el conductor sin carga...");
   hallCurrentMonitor.calibrateZero(250);
   if (kKnownLoadCurrentA >= kMinHallCalibrationCurrentA) {
+    lcdBoot("Calibrando Hall", "Gain en curso");
     Serial.print("Calibrando ganancia Hall para carga conocida de ");
     Serial.print(kKnownLoadCurrentA, 1);
     Serial.println("A...");
     if (hallCurrentMonitor.calibrateGainFromKnownCurrent(kKnownLoadCurrentA, 300)) {
+      lcdBoot("Gain Hall OK", "Calibrado", 700);
       Serial.print("Ganancia Hall ajustada a: ");
       Serial.println(hallCurrentMonitor.currentGain(), 4);
     } else {
+      lcdBoot("Gain Hall ERROR", "Revise carga", 1200);
       Serial.println("No se pudo ajustar ganancia Hall (corriente medida muy baja).");
     }
   } else {
+    lcdBoot("Gain Hall omit.", "Carga < 3.0A", 900);
     Serial.print("Calibracion de ganancia omitida: usar carga >=");
     Serial.print(kMinHallCalibrationCurrentA, 1);
     Serial.println("A.");
@@ -236,6 +478,21 @@ void setup() {
   printHallCommandHelp();
   ledStatus.begin(40);
   ledStatus.runStartupSequence();
+  lcdBoot("Sistema listo", "Serial 115200", 1000);
+  lcd.clear();
+  gSerialCommandLen = 0;
+  gSerialCommand[0] = '\0';
+  gLine1WindowStartMs = millis();
+  gLine1EdgeCountIsr = 0;
+  gLine1LowSamples = 0;
+  gLine1AcPresent = false;
+  gLine1AcInitialized = false;
+  gLine1AlertUntilMs = 0;
+  gLine1AlertType = Line1AlertType::None;
+  gAlertScreenVisible = false;
+  gLcdScreenIndex = 0;
+  gLcdRefreshRequested = true;
+  gLastLcdRotateMs = millis();
 }
 
 void loop() {
@@ -245,6 +502,8 @@ void loop() {
   batteryMonitor.update(nowMs);
   hallCurrentMonitor.update(nowMs);
   updatePzem(nowMs);
+  updateLine1Ac(nowMs);
+  updateLcdDashboard(nowMs);
   ledStatus.update(nowMs, batteryMonitor.chargeStage(), batteryMonitor.data().status);
   printTelemetryJson(nowMs);
 }
