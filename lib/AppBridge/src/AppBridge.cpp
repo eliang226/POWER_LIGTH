@@ -8,8 +8,8 @@ namespace {
 constexpr uint32_t kWifiRetryMs = 7000;
 constexpr uint32_t kMqttRetryMs = 5000;
 constexpr uint32_t kTelemetryPublishMs = 5000;
-constexpr uint16_t kMqttBufferSize = 2048;
-constexpr size_t kDiscoveryPayloadSize = 1900;
+constexpr uint16_t kMqttBufferSize = 3072;
+constexpr size_t kDiscoveryPayloadSize = 2600;
 
 const char* kTplPzemVoltage = "{% if value_json.pzem_valid %}{{ value_json.pzem_v }}{% else %}unknown{% endif %}";
 const char* kTplPzemCurrent = "{% if value_json.pzem_valid %}{{ value_json.pzem_a }}{% else %}unknown{% endif %}";
@@ -22,6 +22,33 @@ const char* kTplLastEvent = "{{ value_json.event }}";
 
 bool hasValue(const char* text) {
   return text && text[0] != '\0';
+}
+
+const char* mqttStateText(int state) {
+  switch (state) {
+    case MQTT_CONNECTION_TIMEOUT:
+      return "timeout";
+    case MQTT_CONNECTION_LOST:
+      return "conexion perdida";
+    case MQTT_CONNECT_FAILED:
+      return "fallo de red/TCP";
+    case MQTT_DISCONNECTED:
+      return "desconectado";
+    case MQTT_CONNECTED:
+      return "conectado";
+    case MQTT_CONNECT_BAD_PROTOCOL:
+      return "protocolo no soportado";
+    case MQTT_CONNECT_BAD_CLIENT_ID:
+      return "client_id rechazado";
+    case MQTT_CONNECT_UNAVAILABLE:
+      return "broker no disponible";
+    case MQTT_CONNECT_BAD_CREDENTIALS:
+      return "credenciales invalidas";
+    case MQTT_CONNECT_UNAUTHORIZED:
+      return "no autorizado";
+    default:
+      return "estado desconocido";
+  }
 }
 }  // namespace
 
@@ -137,6 +164,11 @@ void AppBridge::ensureMqtt(uint32_t nowMs) {
   }
   lastMqttAttemptMs_ = nowMs;
 
+  Serial.print("AppBridge: intentando MQTT ");
+  Serial.print(APP_MQTT_HOST);
+  Serial.print(":");
+  Serial.println(APP_MQTT_PORT);
+
   bool connected = false;
   if (hasValue(APP_MQTT_USERNAME)) {
     connected = mqttClient_.connect(
@@ -160,8 +192,23 @@ void AppBridge::ensureMqtt(uint32_t nowMs) {
     onMqttConnected(nowMs);
     Serial.println("AppBridge: MQTT conectado.");
   } else {
+    const int state = mqttClient_.state();
     Serial.print("AppBridge: MQTT fallo, estado=");
-    Serial.println(mqttClient_.state());
+    Serial.print(state);
+    Serial.print(" (");
+    Serial.print(mqttStateText(state));
+    Serial.print(") host=");
+    Serial.print(APP_MQTT_HOST);
+    Serial.print(" puerto=");
+    Serial.println(APP_MQTT_PORT);
+
+    if (state == MQTT_CONNECT_BAD_CREDENTIALS || state == MQTT_CONNECT_UNAUTHORIZED) {
+      Serial.println("AppBridge: revisa APP_MQTT_USERNAME y APP_MQTT_PASSWORD.");
+    } else if (state == MQTT_CONNECT_FAILED || state == MQTT_CONNECTION_TIMEOUT) {
+      Serial.println("AppBridge: revisa IP del broker, puerto y acceso de red desde el ESP.");
+    } else if (state == MQTT_CONNECT_UNAVAILABLE) {
+      Serial.println("AppBridge: broker MQTT no disponible o servicio detenido.");
+    }
   }
 }
 
@@ -239,7 +286,10 @@ void AppBridge::publishDiscovery(uint32_t nowMs) {
       kTplLastEvent);
 
   if (written <= 0 || static_cast<size_t>(written) >= sizeof(payload)) {
-    Serial.println("AppBridge: payload discovery truncado, aumenta buffer.");
+    Serial.print("AppBridge: payload discovery truncado. requerido=");
+    Serial.print(written);
+    Serial.print(" buffer=");
+    Serial.println(sizeof(payload));
     return;
   }
 
