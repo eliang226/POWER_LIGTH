@@ -38,9 +38,24 @@ void AppBridge::mqttCallbackRouter(char* topic, uint8_t* payload, unsigned int l
 }
 
 void AppBridge::begin() {
-  canRun_ = hasValue(APP_WIFI_SSID) && hasValue(APP_MQTT_HOST);
+  snprintf(wifiSsid_, sizeof(wifiSsid_), "%s", APP_WIFI_SSID);
+  snprintf(wifiPassword_, sizeof(wifiPassword_), "%s", APP_WIFI_PASSWORD);
+
+#if APP_WIFI_ALLOW_SERIAL_INPUT
+  if (!hasValue(wifiSsid_)) {
+    promptWifiCredentialsFromSerial(APP_WIFI_SERIAL_TIMEOUT_MS);
+  }
+#endif
+
+  canRun_ = hasValue(wifiSsid_) && hasValue(APP_MQTT_HOST);
   if (!canRun_) {
     Serial.println("AppBridge: deshabilitado (faltan credenciales WiFi/MQTT).");
+    if (!hasValue(wifiSsid_)) {
+      Serial.println("AppBridge: SSID vacio.");
+    }
+    if (!hasValue(APP_MQTT_HOST)) {
+      Serial.println("AppBridge: MQTT host vacio.");
+    }
     return;
   }
 
@@ -58,6 +73,7 @@ void AppBridge::begin() {
       APP_DEVICE_ID);
 
   discoveryPublished_ = false;
+  wifiConnectedLogged_ = false;
   WiFi.mode(WIFI_STA);
   mqttClient_.setServer(APP_MQTT_HOST, APP_MQTT_PORT);
   mqttClient_.setCallback(AppBridge::mqttCallbackRouter);
@@ -67,7 +83,37 @@ void AppBridge::begin() {
 }
 
 void AppBridge::ensureWifi(uint32_t nowMs) {
-  if (!canRun_ || WiFi.status() == WL_CONNECTED) {
+  if (!canRun_) {
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiConnectedLogged_) {
+      const String connectedSsid = WiFi.SSID();
+      const String ipText = WiFi.localIP().toString();
+      Serial.print("AppBridge: WiFi conectado OK. SSID=");
+      Serial.print(connectedSsid);
+      Serial.print(" IP=");
+      Serial.print(ipText);
+      Serial.print(" RSSI=");
+      Serial.println(WiFi.RSSI());
+
+      if (connectedSsid != String(wifiSsid_)) {
+        Serial.print("AppBridge: advertencia, SSID conectado distinto al configurado: ");
+        Serial.println(wifiSsid_);
+      }
+      wifiConnectedLogged_ = true;
+    }
+    return;
+  }
+
+  if (wifiConnectedLogged_) {
+    wifiConnectedLogged_ = false;
+    Serial.println("AppBridge: WiFi desconectado, reintentando...");
+  }
+
+  if (hasValue(wifiSsid_) == false) {
+    Serial.println("AppBridge: SSID no definido, no se puede reconectar WiFi.");
     return;
   }
 
@@ -77,8 +123,8 @@ void AppBridge::ensureWifi(uint32_t nowMs) {
   lastWifiAttemptMs_ = nowMs;
 
   Serial.print("AppBridge: conectando WiFi ");
-  Serial.println(APP_WIFI_SSID);
-  WiFi.begin(APP_WIFI_SSID, APP_WIFI_PASSWORD);
+  Serial.println(wifiSsid_);
+  WiFi.begin(wifiSsid_, wifiPassword_);
 }
 
 void AppBridge::ensureMqtt(uint32_t nowMs) {
@@ -237,6 +283,60 @@ void AppBridge::subscribeHaStatus() {
   if (!mqttClient_.subscribe(topicHaStatus_)) {
     Serial.println("AppBridge: no se pudo suscribir a homeassistant/status.");
   }
+}
+
+bool AppBridge::promptWifiCredentialsFromSerial(uint32_t timeoutMs) {
+  if (timeoutMs == 0) {
+    return false;
+  }
+
+  Serial.println("AppBridge: ingresa credenciales por Serial en formato WIFI:ssid,password");
+  Serial.print("AppBridge: esperando ");
+  Serial.print(static_cast<unsigned long>(timeoutMs));
+  Serial.println(" ms...");
+
+  char line[192] = {0};
+  size_t len = 0;
+  const uint32_t startMs = millis();
+
+  while (static_cast<uint32_t>(millis() - startMs) < timeoutMs) {
+    while (Serial.available() > 0) {
+      const char c = static_cast<char>(Serial.read());
+      if (c == '\r' || c == '\n') {
+        if (len == 0) {
+          continue;
+        }
+        line[len] = '\0';
+        if (strncmp(line, "WIFI:", 5) == 0) {
+          char* creds = line + 5;
+          char* comma = strchr(creds, ',');
+          if (comma != nullptr) {
+            *comma = '\0';
+            const char* ssid = creds;
+            const char* pass = comma + 1;
+            if (hasValue(ssid)) {
+              snprintf(wifiSsid_, sizeof(wifiSsid_), "%s", ssid);
+              snprintf(wifiPassword_, sizeof(wifiPassword_), "%s", pass);
+              Serial.print("AppBridge: SSID recibido por Serial: ");
+              Serial.println(wifiSsid_);
+              return true;
+            }
+          }
+        }
+        Serial.println("AppBridge: formato invalido. Usa WIFI:ssid,password");
+        len = 0;
+        continue;
+      }
+
+      if (len < (sizeof(line) - 1)) {
+        line[len++] = c;
+      }
+    }
+    delay(10);
+  }
+
+  Serial.println("AppBridge: timeout de Serial, no se recibieron credenciales WiFi.");
+  return false;
 }
 
 void AppBridge::publishTelemetry(const AppTelemetry& telemetry, uint32_t nowMs) {

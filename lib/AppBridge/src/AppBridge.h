@@ -31,11 +31,14 @@ class AppBridge {
  private:
   bool canRun_ = false;
   bool discoveryPublished_ = false;
+  bool wifiConnectedLogged_ = false;
   uint32_t lastWifiAttemptMs_ = 0;
   uint32_t lastMqttAttemptMs_ = 0;
   uint32_t lastTelemetryPublishMs_ = 0;
 
   char clientId_[48] = {0};
+  char wifiSsid_[64] = {0};
+  char wifiPassword_[96] = {0};
   char topicStatus_[96] = {0};
   char topicTelemetry_[96] = {0};
   char topicAlert_[96] = {0};
@@ -53,5 +56,6 @@ class AppBridge {
   void publishDiscovery(uint32_t nowMs);
   void handleMqttMessage(char* topic, uint8_t* payload, unsigned int length);
   void subscribeHaStatus();
+  bool promptWifiCredentialsFromSerial(uint32_t timeoutMs);
   bool mqttReady();
 };

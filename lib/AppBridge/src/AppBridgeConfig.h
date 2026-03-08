@@ -46,6 +46,14 @@
 #define APP_WIFI_PASSWORD ""
 #endif
 
+#ifndef APP_WIFI_ALLOW_SERIAL_INPUT
+#define APP_WIFI_ALLOW_SERIAL_INPUT 1
+#endif
+
+#ifndef APP_WIFI_SERIAL_TIMEOUT_MS
+#define APP_WIFI_SERIAL_TIMEOUT_MS 20000
+#endif
+
 #ifndef APP_MQTT_HOST
 #define APP_MQTT_HOST ""
 #endif
