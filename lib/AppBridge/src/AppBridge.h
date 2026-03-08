@@ -30,6 +30,7 @@ class AppBridge {
 
  private:
   bool canRun_ = false;
+  bool discoveryPublished_ = false;
   uint32_t lastWifiAttemptMs_ = 0;
   uint32_t lastMqttAttemptMs_ = 0;
   uint32_t lastTelemetryPublishMs_ = 0;
@@ -38,11 +39,19 @@ class AppBridge {
   char topicStatus_[96] = {0};
   char topicTelemetry_[96] = {0};
   char topicAlert_[96] = {0};
+  char topicHaStatus_[96] = {0};
+  char topicDiscoveryConfig_[128] = {0};
 
   WiFiClient wifiClient_;
   PubSubClient mqttClient_;
+  static AppBridge* instance_;
 
+  static void mqttCallbackRouter(char* topic, uint8_t* payload, unsigned int length);
   void ensureWifi(uint32_t nowMs);
   void ensureMqtt(uint32_t nowMs);
+  void onMqttConnected(uint32_t nowMs);
+  void publishDiscovery(uint32_t nowMs);
+  void handleMqttMessage(char* topic, uint8_t* payload, unsigned int length);
+  void subscribeHaStatus();
   bool mqttReady();
 };

@@ -14,6 +14,30 @@
 #define APP_MQTT_TOPIC_BASE "home/power_light_v1_banco"
 #endif
 
+#ifndef APP_HA_DISCOVERY_PREFIX
+#define APP_HA_DISCOVERY_PREFIX "homeassistant"
+#endif
+
+#ifndef APP_HA_ENABLE_DISCOVERY
+#define APP_HA_ENABLE_DISCOVERY 1
+#endif
+
+#ifndef APP_HA_DEVICE_NAME
+#define APP_HA_DEVICE_NAME "POWER LIGHT V1"
+#endif
+
+#ifndef APP_HA_DEVICE_MODEL
+#define APP_HA_DEVICE_MODEL "XIAO ESP32-C6 + PZEM004T"
+#endif
+
+#ifndef APP_HA_DEVICE_MANUFACTURER
+#define APP_HA_DEVICE_MANUFACTURER "DIY"
+#endif
+
+#ifndef APP_HA_SW_VERSION
+#define APP_HA_SW_VERSION "1.0.0"
+#endif
+
 #ifndef APP_WIFI_SSID
 #define APP_WIFI_SSID ""
 #endif
