@@ -15,12 +15,15 @@ struct AppTelemetry {
   uint8_t batteryCapacityPercent = 0;
 };
 
+using AppCommandCallback = void (*)(const char* command);
+
 class AppBridge {
  public:
   AppBridge();
 
   void begin();
   void update(uint32_t nowMs);
+  void setCommandCallback(AppCommandCallback callback);
 
   void publishTelemetry(const AppTelemetry& telemetry, uint32_t nowMs);
   void publishAlert(const char* eventCode, uint32_t nowMs);
@@ -42,8 +45,10 @@ class AppBridge {
   char topicStatus_[96] = {0};
   char topicTelemetry_[96] = {0};
   char topicAlert_[96] = {0};
+  char topicCommand_[96] = {0};
   char topicHaStatus_[96] = {0};
   char topicDiscoveryConfig_[128] = {0};
+  AppCommandCallback commandCallback_ = nullptr;
 
   WiFiClient wifiClient_;
   PubSubClient mqttClient_;
@@ -56,6 +61,7 @@ class AppBridge {
   void publishDiscovery(uint32_t nowMs);
   void handleMqttMessage(char* topic, uint8_t* payload, unsigned int length);
   void subscribeHaStatus();
+  void subscribeCommandTopic();
   bool promptWifiCredentialsFromSerial(uint32_t timeoutMs);
   bool mqttReady();
 };

@@ -27,6 +27,7 @@ struct BatteryData {
   uint16_t raw = 0;
   uint16_t adcMilliVolts = 0;
   float adcVoltage = 0.0f;
+  float sensedBatteryVoltage = 0.0f;
   float batteryVoltage = 0.0f;
   float filteredBatteryVoltage = 0.0f;
   BatteryStatus status = BatteryStatus::BelowRange;
@@ -35,14 +36,22 @@ struct BatteryData {
   bool initialized = false;
 };
 
+struct BatteryCalibration {
+  float scale = 1.05f;
+  float offsetV = 0.0f;
+};
+
 class BatteryMonitor {
  public:
   explicit BatteryMonitor(uint8_t adcPin);
 
   void begin();
   void update(uint32_t nowMs);
+  void setCalibration(const BatteryCalibration& calibration);
+  bool calibrateFromMeasuredVoltage(float measuredBatteryVoltage);
 
   const BatteryData& data() const;
+  BatteryCalibration calibration() const;
   ChargeStage chargeStage() const;
 
   static const char* rangeStatusText(BatteryStatus status);
@@ -52,11 +61,14 @@ class BatteryMonitor {
  private:
   BatteryAdcAverages readAverages() const;
   static float rawToAdcVoltage(uint16_t raw);
-  static float adcToBatteryVoltage(float adcVoltage);
+  static bool isValidCalibrationScale(float scale);
+  static bool isValidCalibrationOffset(float offsetV);
+  static float applyCalibration(float sensedBatteryVoltage, const BatteryCalibration& calibration);
   static BatteryStatus evaluateBatteryStatus(float batteryVoltage);
   static ChargeStage evaluateChargeStage(float batteryVoltage, BatteryStatus rangeStatus, bool lowBatteryAlarm);
 
   uint8_t adcPin_;
   uint32_t lastReadMs_ = 0;
   BatteryData data_;
+  BatteryCalibration calibration_;
 };

@@ -10,8 +10,10 @@ constexpr float kR1Ohm = 40200.0f;
 constexpr float kR2Ohm = 10000.0f;
 constexpr float kBatteryMinReportV = 5.0f;
 constexpr float kBatteryMaxSafeV = 16.5f;
-constexpr float kBatteryCalibrationScale = 1.05f;
-constexpr float kBatteryCalibrationOffsetV = 0.0f;
+constexpr float kMinBatteryCalibrationScale = 0.5f;
+constexpr float kMaxBatteryCalibrationScale = 1.5f;
+constexpr float kMinBatteryCalibrationOffsetV = -2.0f;
+constexpr float kMaxBatteryCalibrationOffsetV = 2.0f;
 constexpr float kBatteryEmaAlpha = 0.20f;
 constexpr uint8_t kBatterySamplesPerRead = 16;
 constexpr uint16_t kBatterySampleSettleUs = 200;
@@ -45,7 +47,8 @@ void BatteryMonitor::update(uint32_t nowMs) {
     data_.adcVoltage = rawToAdcVoltage(data_.raw);
   }
 
-  data_.batteryVoltage = adcToBatteryVoltage(data_.adcVoltage);
+  data_.sensedBatteryVoltage = data_.adcVoltage * ((kR1Ohm + kR2Ohm) / kR2Ohm);
+  data_.batteryVoltage = applyCalibration(data_.sensedBatteryVoltage, calibration_);
   data_.status = evaluateBatteryStatus(data_.batteryVoltage);
 
   if (!data_.initialized) {
@@ -70,8 +73,54 @@ void BatteryMonitor::update(uint32_t nowMs) {
   }
 }
 
+void BatteryMonitor::setCalibration(const BatteryCalibration& calibration) {
+  if (!isValidCalibrationScale(calibration.scale) ||
+      !isValidCalibrationOffset(calibration.offsetV)) {
+    return;
+  }
+
+  calibration_ = calibration;
+  if (!data_.initialized) {
+    return;
+  }
+
+  data_.batteryVoltage = applyCalibration(data_.sensedBatteryVoltage, calibration_);
+  data_.filteredBatteryVoltage = data_.batteryVoltage;
+  data_.status = evaluateBatteryStatus(data_.batteryVoltage);
+}
+
+bool BatteryMonitor::calibrateFromMeasuredVoltage(float measuredBatteryVoltage) {
+  if (!isfinite(measuredBatteryVoltage) || measuredBatteryVoltage <= 0.0f) {
+    return false;
+  }
+  if (!isfinite(data_.sensedBatteryVoltage) || data_.sensedBatteryVoltage <= 0.0f) {
+    return false;
+  }
+
+  const float numerator = measuredBatteryVoltage - calibration_.offsetV;
+  if (numerator <= 0.0f) {
+    return false;
+  }
+
+  BatteryCalibration updated = calibration_;
+  updated.scale = numerator / data_.sensedBatteryVoltage;
+  if (!isValidCalibrationScale(updated.scale)) {
+    return false;
+  }
+
+  calibration_ = updated;
+  data_.batteryVoltage = measuredBatteryVoltage;
+  data_.filteredBatteryVoltage = measuredBatteryVoltage;
+  data_.status = evaluateBatteryStatus(data_.batteryVoltage);
+  return true;
+}
+
 const BatteryData& BatteryMonitor::data() const {
   return data_;
+}
+
+BatteryCalibration BatteryMonitor::calibration() const {
+  return calibration_;
 }
 
 ChargeStage BatteryMonitor::chargeStage() const {
@@ -143,10 +192,21 @@ float BatteryMonitor::rawToAdcVoltage(uint16_t raw) {
   return (static_cast<float>(raw) * kAdcReferenceV) / static_cast<float>(kAdcMaxCount);
 }
 
-float BatteryMonitor::adcToBatteryVoltage(float adcVoltage) {
-  const float dividerGain = (kR1Ohm + kR2Ohm) / kR2Ohm;
-  const float batteryVoltage = adcVoltage * dividerGain;
-  return (batteryVoltage * kBatteryCalibrationScale) + kBatteryCalibrationOffsetV;
+bool BatteryMonitor::isValidCalibrationScale(float scale) {
+  return isfinite(scale) &&
+         scale >= kMinBatteryCalibrationScale &&
+         scale <= kMaxBatteryCalibrationScale;
+}
+
+bool BatteryMonitor::isValidCalibrationOffset(float offsetV) {
+  return isfinite(offsetV) &&
+         offsetV >= kMinBatteryCalibrationOffsetV &&
+         offsetV <= kMaxBatteryCalibrationOffsetV;
+}
+
+float BatteryMonitor::applyCalibration(float sensedBatteryVoltage,
+                                       const BatteryCalibration& calibration) {
+  return (sensedBatteryVoltage * calibration.scale) + calibration.offsetV;
 }
 
 BatteryStatus BatteryMonitor::evaluateBatteryStatus(float batteryVoltage) {

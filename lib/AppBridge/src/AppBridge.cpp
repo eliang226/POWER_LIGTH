@@ -64,6 +64,10 @@ void AppBridge::mqttCallbackRouter(char* topic, uint8_t* payload, unsigned int l
   }
 }
 
+void AppBridge::setCommandCallback(AppCommandCallback callback) {
+  commandCallback_ = callback;
+}
+
 void AppBridge::begin() {
   snprintf(wifiSsid_, sizeof(wifiSsid_), "%s", APP_WIFI_SSID);
   snprintf(wifiPassword_, sizeof(wifiPassword_), "%s", APP_WIFI_PASSWORD);
@@ -91,6 +95,7 @@ void AppBridge::begin() {
   snprintf(topicStatus_, sizeof(topicStatus_), "%s/status", APP_MQTT_TOPIC_BASE);
   snprintf(topicTelemetry_, sizeof(topicTelemetry_), "%s/telemetry", APP_MQTT_TOPIC_BASE);
   snprintf(topicAlert_, sizeof(topicAlert_), "%s/alert", APP_MQTT_TOPIC_BASE);
+  snprintf(topicCommand_, sizeof(topicCommand_), "%s/cmd", APP_MQTT_TOPIC_BASE);
   snprintf(topicHaStatus_, sizeof(topicHaStatus_), "%s/status", APP_HA_DISCOVERY_PREFIX);
   snprintf(
       topicDiscoveryConfig_,
@@ -228,6 +233,7 @@ void AppBridge::update(uint32_t nowMs) {
 void AppBridge::onMqttConnected(uint32_t nowMs) {
   discoveryPublished_ = false;
   mqttClient_.publish(topicStatus_, "online", true);
+  subscribeCommandTopic();
   subscribeHaStatus();
   publishDiscovery(nowMs);
 }
@@ -305,10 +311,23 @@ void AppBridge::handleMqttMessage(char* topic, uint8_t* payload, unsigned int le
   if (!hasValue(topic) || payload == nullptr || !mqttClient_.connected()) {
     return;
   }
-#if !APP_HA_ENABLE_DISCOVERY
-  return;
-#endif
 
+  if (strcmp(topic, topicCommand_) == 0) {
+    if (commandCallback_ == nullptr) {
+      return;
+    }
+    char command[160] = {0};
+    const unsigned int copyLen = (length < (sizeof(command) - 1)) ? length : (sizeof(command) - 1);
+    if (copyLen == 0) {
+      return;
+    }
+    memcpy(command, payload, copyLen);
+    command[copyLen] = '\0';
+    commandCallback_(command);
+    return;
+  }
+
+#if APP_HA_ENABLE_DISCOVERY
   if (strcmp(topic, topicHaStatus_) != 0) {
     return;
   }
@@ -324,6 +343,7 @@ void AppBridge::handleMqttMessage(char* topic, uint8_t* payload, unsigned int le
     discoveryPublished_ = false;
     publishDiscovery(millis());
   }
+#endif
 }
 
 void AppBridge::subscribeHaStatus() {
@@ -332,6 +352,15 @@ void AppBridge::subscribeHaStatus() {
 #endif
   if (!mqttClient_.subscribe(topicHaStatus_)) {
     Serial.println("AppBridge: no se pudo suscribir a homeassistant/status.");
+  }
+}
+
+void AppBridge::subscribeCommandTopic() {
+  if (!mqttClient_.subscribe(topicCommand_)) {
+    Serial.println("AppBridge: no se pudo suscribir al topico de comandos.");
+  } else {
+    Serial.print("AppBridge: topico comandos ");
+    Serial.println(topicCommand_);
   }
 }
 

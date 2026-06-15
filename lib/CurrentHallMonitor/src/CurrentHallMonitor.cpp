@@ -2,6 +2,10 @@
 
 namespace {
 constexpr uint32_t kReadIntervalMs = 100;
+constexpr float kMinZeroCurrentVoltage = 0.0f;
+constexpr float kMaxZeroCurrentVoltage = 5.0f;
+constexpr float kMinCurrentGain = 0.05f;
+constexpr float kMaxCurrentGain = 10.0f;
 }
 
 CurrentHallMonitor::CurrentHallMonitor(const HallMonitorConfig& config) : config_(config) {}
@@ -12,13 +16,15 @@ void CurrentHallMonitor::begin() {
 #ifdef ADC_11db
   analogSetPinAttenuation(config_.adcPin, ADC_11db);
 #endif
+  data_.zeroCurrentVoltage = zeroCurrentVoltage();
 }
 
 void CurrentHallMonitor::calibrateZero(uint16_t samples) {
-  const uint16_t avgMv = readAdcMilliVoltsAvg(samples);
-  const float adcV = static_cast<float>(avgMv) / 1000.0f;
+  const HallAdcAverages averages = readAdcAverages(samples);
+  const float adcV = static_cast<float>(averages.milliVolts) / 1000.0f;
   const float sensedV = adcV / dividerRatio();
   centerOffsetV_ = sensedV - config_.sensorCenterV;
+  data_.zeroCurrentVoltage = config_.sensorCenterV + centerOffsetV_;
 }
 
 bool CurrentHallMonitor::calibrateGainFromKnownCurrent(float knownCurrentA, uint16_t samples) {
@@ -26,8 +32,8 @@ bool CurrentHallMonitor::calibrateGainFromKnownCurrent(float knownCurrentA, uint
     return false;
   }
 
-  const uint16_t avgMv = readAdcMilliVoltsAvg(samples);
-  const float adcV = static_cast<float>(avgMv) / 1000.0f;
+  const HallAdcAverages averages = readAdcAverages(samples);
+  const float adcV = static_cast<float>(averages.milliVolts) / 1000.0f;
   const float sensedV = adcV / dividerRatio();
   const float centeredV = sensedV - (config_.sensorCenterV + centerOffsetV_);
 
@@ -40,18 +46,36 @@ bool CurrentHallMonitor::calibrateGainFromKnownCurrent(float knownCurrentA, uint
   return true;
 }
 
+void CurrentHallMonitor::setCalibration(const HallCalibration& calibration) {
+  if (!isfinite(calibration.zeroCurrentVoltage) ||
+      !isfinite(calibration.currentGain) ||
+      calibration.zeroCurrentVoltage < kMinZeroCurrentVoltage ||
+      calibration.zeroCurrentVoltage > kMaxZeroCurrentVoltage ||
+      calibration.currentGain < kMinCurrentGain ||
+      calibration.currentGain > kMaxCurrentGain) {
+    return;
+  }
+
+  centerOffsetV_ = calibration.zeroCurrentVoltage - config_.sensorCenterV;
+  currentGain_ = calibration.currentGain;
+  data_.zeroCurrentVoltage = calibration.zeroCurrentVoltage;
+}
+
 void CurrentHallMonitor::update(uint32_t nowMs) {
   if (nowMs - lastReadMs_ < kReadIntervalMs) {
     return;
   }
   lastReadMs_ = nowMs;
 
-  const uint16_t avgMv = readAdcMilliVoltsAvg(config_.samplesPerRead);
-  data_.adcMilliVolts = avgMv;
-  data_.adcVoltage = static_cast<float>(avgMv) / 1000.0f;
+  const HallAdcAverages averages = readAdcAverages(config_.samplesPerRead);
+  data_.adcRaw = averages.raw;
+  data_.adcMilliVolts = averages.milliVolts;
+  data_.adcVoltage = static_cast<float>(averages.milliVolts) / 1000.0f;
   data_.sensorVoltage = data_.adcVoltage / dividerRatio();
+  data_.zeroCurrentVoltage = config_.sensorCenterV + centerOffsetV_;
 
-  const float centeredV = data_.sensorVoltage - (config_.sensorCenterV + centerOffsetV_);
+  const float centeredV = data_.sensorVoltage - data_.zeroCurrentVoltage;
+  data_.centeredVoltage = centeredV;
   const float currentA = (centeredV / sensitivityVperA()) * currentGain_;
 
   if (config_.bidirectional) {
@@ -74,23 +98,39 @@ const HallCurrentData& CurrentHallMonitor::data() const {
   return data_;
 }
 
+HallCalibration CurrentHallMonitor::calibration() const {
+  HallCalibration calibration;
+  calibration.zeroCurrentVoltage = zeroCurrentVoltage();
+  calibration.currentGain = currentGain_;
+  return calibration;
+}
+
 float CurrentHallMonitor::currentGain() const {
   return currentGain_;
 }
 
-uint16_t CurrentHallMonitor::readAdcMilliVoltsAvg(uint16_t samples) const {
+float CurrentHallMonitor::zeroCurrentVoltage() const {
+  return config_.sensorCenterV + centerOffsetV_;
+}
+
+HallAdcAverages CurrentHallMonitor::readAdcAverages(uint16_t samples) const {
   if (samples == 0) {
     samples = 1;
   }
 
+  uint32_t sumRaw = 0;
   uint32_t sumMv = 0;
   for (uint16_t i = 0; i < samples; ++i) {
     (void)analogRead(config_.adcPin);
     delayMicroseconds(config_.settleUs);
+    sumRaw += analogRead(config_.adcPin);
     sumMv += analogReadMilliVolts(config_.adcPin);
   }
 
-  return static_cast<uint16_t>(sumMv / samples);
+  HallAdcAverages averages;
+  averages.raw = static_cast<uint16_t>(sumRaw / samples);
+  averages.milliVolts = static_cast<uint16_t>(sumMv / samples);
+  return averages;
 }
 
 float CurrentHallMonitor::dividerRatio() const {
@@ -102,8 +142,11 @@ float CurrentHallMonitor::dividerRatio() const {
 }
 
 float CurrentHallMonitor::sensitivityVperA() const {
-  if (config_.fullScaleCurrentA <= 0.0f) {
-    return 1.0f;
+  if (config_.sensorSensitivityVPerA > 0.0f) {
+    return config_.sensorSensitivityVPerA;
   }
-  return config_.sensorSpanV / config_.fullScaleCurrentA;
+  if (config_.fullScaleCurrentA > 0.0f && config_.sensorSpanV > 0.0f) {
+    return config_.sensorSpanV / config_.fullScaleCurrentA;
+  }
+  return 1.0f;
 }

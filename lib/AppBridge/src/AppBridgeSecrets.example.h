@@ -13,3 +13,7 @@
 
 #define APP_DEVICE_ID "power_light_v1_banco"
 #define APP_MQTT_TOPIC_BASE "home/power_light_v1_banco"
+
+#define APP_TELEGRAM_ENABLE 1
+#define APP_TELEGRAM_BOT_TOKEN "123456789:ABCDEF_REPLACE_ME"
+#define APP_TELEGRAM_CHAT_ID "123456789"

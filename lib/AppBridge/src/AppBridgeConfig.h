@@ -69,3 +69,15 @@
 #ifndef APP_MQTT_PASSWORD
 #define APP_MQTT_PASSWORD ""
 #endif
+
+#ifndef APP_TELEGRAM_ENABLE
+#define APP_TELEGRAM_ENABLE 1
+#endif
+
+#ifndef APP_TELEGRAM_BOT_TOKEN
+#define APP_TELEGRAM_BOT_TOKEN ""
+#endif
+
+#ifndef APP_TELEGRAM_CHAT_ID
+#define APP_TELEGRAM_CHAT_ID ""
+#endif

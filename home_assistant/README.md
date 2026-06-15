@@ -19,6 +19,7 @@ And runtime topics remain:
 - `<APP_MQTT_TOPIC_BASE>/status`
 - `<APP_MQTT_TOPIC_BASE>/telemetry`
 - `<APP_MQTT_TOPIC_BASE>/alert`
+- `<APP_MQTT_TOPIC_BASE>/cmd` (send console commands via MQTT)
 
 ## Quick validation on Raspberry (2 min)
 
@@ -48,3 +49,27 @@ Expected results:
 2. Status topic prints `online`.
 3. Telemetry topic updates every few seconds.
 4. Alert topic publishes `LINE1_LOST` / `LINE1_RESTORED` on transitions.
+
+## MQTT commands
+
+You can execute the same console commands through MQTT by publishing to:
+
+- `home/power_light_v1_banco/cmd`
+
+Examples:
+
+```bash
+# Current direction and deadband
+mosquitto_pub -h <BROKER_IP> -p 1883 -u <USER> -P <PASS> \
+  -t "home/power_light_v1_banco/cmd" -m "CURR STATUS"
+mosquitto_pub -h <BROKER_IP> -p 1883 -u <USER> -P <PASS> \
+  -t "home/power_light_v1_banco/cmd" -m "CURR DIR -1"
+mosquitto_pub -h <BROKER_IP> -p 1883 -u <USER> -P <PASS> \
+  -t "home/power_light_v1_banco/cmd" -m "CURR DEAD 0.15"
+
+# Hall calibration
+mosquitto_pub -h <BROKER_IP> -p 1883 -u <USER> -P <PASS> \
+  -t "home/power_light_v1_banco/cmd" -m "HALL ZERO"
+mosquitto_pub -h <BROKER_IP> -p 1883 -u <USER> -P <PASS> \
+  -t "home/power_light_v1_banco/cmd" -m "HALL GAIN 1.0"
+```
