@@ -46,9 +46,10 @@ constexpr float kMaxHallDeadbandA = 5.0f;
 constexpr float kCriticalLowBatteryV = 10.5f;
 constexpr uint16_t kLowBatteryBeepOnMs = 80;
 constexpr uint16_t kLowBatteryBeepOffMs = 80;
-constexpr uint32_t kTelegramPollIntervalMs = 5000;
+constexpr uint32_t kTelegramPollIntervalMs = 1500;
 constexpr uint32_t kTelegramLowBatteryRepeatMs = 900000;
-constexpr uint32_t kTelegramHttpTimeoutMs = 7000;
+constexpr uint32_t kTelegramHttpTimeoutMs = 3500;
+constexpr uint32_t kTelegramStartupRetryMs = 30000;
 constexpr uint32_t kPzemFaultStartupGraceMs = 15000;
 constexpr size_t kSerialCmdBufferSize = 96;
 constexpr char kConfigNamespace[] = "pl_config";
@@ -122,6 +123,7 @@ bool gLowBatteryCriticalActive = false;
 bool gLowBatteryBeepState = false;
 uint32_t gLowBatteryBeepLastToggleMs = 0;
 uint32_t gLastTelegramPollMs = 0;
+uint32_t gLastTelegramStartupAttemptMs = 0;
 uint32_t gLastLowBatteryTelegramMs = 0;
 int32_t gTelegramLastUpdateId = 0;
 bool gPzemFaultActive = false;
@@ -133,12 +135,22 @@ void onMqttConsoleCommand(const char* command);
 bool isPzemDataFresh(uint32_t nowMs);
 uint8_t estimateBatteryCapacityPercent(float batteryVoltage);
 bool buildStatusMessage(char* buffer, size_t bufferSize, uint32_t nowMs);
+bool buildBatteryMessage(char* buffer, size_t bufferSize);
+bool buildCurrentMessage(char* buffer, size_t bufferSize);
+bool buildRtcMessage(char* buffer, size_t bufferSize);
+bool buildAlertMessage(char* buffer, size_t bufferSize);
+bool buildTelegramHelpMessage(char* buffer, size_t bufferSize);
 bool telegramEnabled();
 bool telegramSendMessage(const char* text);
 void pollTelegramCommands(uint32_t nowMs);
 void updateLowBatteryAlarm(uint32_t nowMs);
 void updatePzemHealthAlert(uint32_t nowMs);
 void maybeSendStartupTelegram(uint32_t nowMs);
+bool extractTelegramCommandText(const char* text, char* commandText, size_t commandTextSize);
+bool startsWithCommand(const char* text, const char* prefix);
+bool isTelegramConsoleCommand(const char* normalizedCommand);
+void handleTelegramConsoleCommand(const char* commandText, uint32_t nowMs);
+void normalizeCommand(char* text);
 void printBatterySnapshot();
 void printHallSnapshot();
 
@@ -321,12 +333,12 @@ bool shouldPlayRestoreAlertNow() {
 }
 
 void playPowerLostAlert() {
-  playBuzzerPattern(4, 1000, 500);
+  playBuzzerPattern(4, 400, 500);
 }
 
 void playPowerRestoredAlert() {
   if (shouldPlayRestoreAlertNow()) {
-    playBuzzerPattern(2, 1000, 500);
+    playBuzzerPattern(2, 400, 500);
   }
 }
 
@@ -555,50 +567,284 @@ bool buildStatusMessage(char* buffer, size_t bufferSize, uint32_t nowMs) {
   return ok;
 }
 
+bool buildBatteryMessage(char* buffer, size_t bufferSize) {
+  if (!buffer || bufferSize == 0) {
+    return false;
+  }
+
+  const BatteryData& battery = batteryMonitor.data();
+  const BatteryCalibration calibration = batteryMonitor.calibration();
+  const uint8_t capPercent = estimateBatteryCapacityPercent(battery.filteredBatteryVoltage);
+
+  return snprintf(
+             buffer,
+             bufferSize,
+             "BAT\nVBat: %.2fV\nVadc: %.3fV Sense: %.2fV\nCal: x%.4f off %.3fV\nSOC: %u%%",
+             battery.filteredBatteryVoltage,
+             battery.adcVoltage,
+             battery.sensedBatteryVoltage,
+             calibration.scale,
+             calibration.offsetV,
+             capPercent) > 0;
+}
+
+bool buildCurrentMessage(char* buffer, size_t bufferSize) {
+  if (!buffer || bufferSize == 0) {
+    return false;
+  }
+
+  const HallCurrentData& current = hallCurrentMonitor.data();
+  const float batteryCurrentA = normalizedBatteryCurrentA(current);
+
+  return snprintf(
+             buffer,
+             bufferSize,
+             "CURR\nIBat: %.2fA %s\nHall: zero %.3fV gain %.4f\nDir: %s dead: %.2fA",
+             batteryCurrentA,
+             batteryFlowText(batteryFlowState(batteryCurrentA)),
+             hallCurrentMonitor.zeroCurrentVoltage(),
+             hallCurrentMonitor.currentGain(),
+             gHallCurrentDirection > 0.0f ? "+1" : "-1",
+             gHallDeadbandA) > 0;
+}
+
+bool buildRtcMessage(char* buffer, size_t bufferSize) {
+  if (!buffer || bufferSize == 0) {
+    return false;
+  }
+
+  if (!gRtcReady) {
+    return snprintf(buffer, bufferSize, "RTC: no disponible.") > 0;
+  }
+
+  const DateTime now = rtc.now();
+  return snprintf(
+             buffer,
+             bufferSize,
+             "RTC: %04d-%02d-%02d %02d:%02d:%02d",
+             now.year(),
+             now.month(),
+             now.day(),
+             now.hour(),
+             now.minute(),
+             now.second()) > 0;
+}
+
+bool buildAlertMessage(char* buffer, size_t bufferSize) {
+  if (!buffer || bufferSize == 0) {
+    return false;
+  }
+
+  if (gRestoreAlertHour == kRestoreHourAny) {
+    return snprintf(
+               buffer,
+               bufferSize,
+               "ALERT\nRetorno: SIEMPRE\nLinea1: %s\nBatCrit: %s\nPZEM: %s",
+               gLine1AcPresent ? "ACTIVA" : "SIN ENERGIA",
+               gLowBatteryCriticalActive ? "ON" : "OFF",
+               gPzemFaultActive ? "FAULT" : "OK") > 0;
+  }
+
+  return snprintf(
+             buffer,
+             bufferSize,
+             "ALERT\nRetorno: HORA %u\nLinea1: %s\nBatCrit: %s\nPZEM: %s",
+             gRestoreAlertHour,
+             gLine1AcPresent ? "ACTIVA" : "SIN ENERGIA",
+             gLowBatteryCriticalActive ? "ON" : "OFF",
+             gPzemFaultActive ? "FAULT" : "OK") > 0;
+}
+
+bool buildTelegramHelpMessage(char* buffer, size_t bufferSize) {
+  if (!buffer || bufferSize == 0) {
+    return false;
+  }
+
+  return snprintf(
+             buffer,
+             bufferSize,
+             "Comandos Telegram:\n"
+             "/estado\n"
+             "/bat\n"
+             "/curr\n"
+             "/rtc\n"
+             "/alert\n"
+             "/help\n"
+             "/cmd BAT STATUS\n"
+             "/cmd CURR ZERO\n"
+             "/cmd CURR CAL 4.2") > 0;
+}
+
+bool startsWithCommand(const char* text, const char* prefix) {
+  if (!text || !prefix) {
+    return false;
+  }
+
+  const size_t prefixLen = strlen(prefix);
+  if (strncmp(text, prefix, prefixLen) != 0) {
+    return false;
+  }
+
+  return text[prefixLen] == '\0' || isspace(static_cast<unsigned char>(text[prefixLen]));
+}
+
+bool isTelegramConsoleCommand(const char* normalizedCommand) {
+  return startsWithCommand(normalizedCommand, "BAT") ||
+         startsWithCommand(normalizedCommand, "CURR") ||
+         startsWithCommand(normalizedCommand, "HALL") ||
+         startsWithCommand(normalizedCommand, "RTC") ||
+         startsWithCommand(normalizedCommand, "ALERT");
+}
+
+bool extractTelegramCommandText(const char* text, char* commandText, size_t commandTextSize) {
+  if (!text || !commandText || commandTextSize == 0) {
+    return false;
+  }
+
+  while (*text != '\0' && isspace(static_cast<unsigned char>(*text))) {
+    ++text;
+  }
+
+  snprintf(commandText, commandTextSize, "%s", text);
+  size_t len = strlen(commandText);
+  while (len > 0 && isspace(static_cast<unsigned char>(commandText[len - 1]))) {
+    commandText[--len] = '\0';
+  }
+
+  if (commandText[0] == '/') {
+    memmove(commandText, commandText + 1, strlen(commandText));
+  }
+
+  char* spacePos = strchr(commandText, ' ');
+  char* atPos = strchr(commandText, '@');
+  if (atPos != nullptr && (spacePos == nullptr || atPos < spacePos)) {
+    if (spacePos != nullptr) {
+      memmove(atPos, spacePos, strlen(spacePos) + 1);
+    } else {
+      *atPos = '\0';
+    }
+  }
+
+  len = strlen(commandText);
+  while (len > 0 && isspace(static_cast<unsigned char>(commandText[len - 1]))) {
+    commandText[--len] = '\0';
+  }
+
+  return commandText[0] != '\0';
+}
+
+void handleTelegramConsoleCommand(const char* commandText, uint32_t nowMs) {
+  if (!commandText || commandText[0] == '\0') {
+    telegramSendMessage("Comando vacio. Usa /help.");
+    return;
+  }
+
+  char normalizedCommand[kSerialCmdBufferSize] = {0};
+  snprintf(normalizedCommand, sizeof(normalizedCommand), "%s", commandText);
+  normalizeCommand(normalizedCommand);
+
+  if (!isTelegramConsoleCommand(normalizedCommand)) {
+    telegramSendMessage("Comando no reconocido. Usa /help.");
+    return;
+  }
+
+  processConsoleCommand(commandText);
+
+  char reply[192] = {0};
+  bool replyReady = false;
+  if (startsWithCommand(normalizedCommand, "BAT")) {
+    replyReady = buildBatteryMessage(reply, sizeof(reply));
+  } else if (startsWithCommand(normalizedCommand, "CURR") || startsWithCommand(normalizedCommand, "HALL")) {
+    replyReady = buildCurrentMessage(reply, sizeof(reply));
+  } else if (startsWithCommand(normalizedCommand, "RTC")) {
+    replyReady = buildRtcMessage(reply, sizeof(reply));
+  } else if (startsWithCommand(normalizedCommand, "ALERT")) {
+    replyReady = buildAlertMessage(reply, sizeof(reply));
+  } else {
+    replyReady = buildStatusMessage(reply, sizeof(reply), nowMs);
+  }
+
+  if (replyReady) {
+    telegramSendMessage(reply);
+  }
+}
+
 void handleTelegramCommand(const char* text, uint32_t nowMs) {
   if (!text || text[0] == '\0') {
     return;
   }
 
-  const char* cursor = text;
-  while (*cursor != '\0' && isspace(static_cast<unsigned char>(*cursor))) {
-    ++cursor;
-  }
-
-  char token[40] = {0};
-  size_t idx = 0;
-  while (*cursor != '\0' && !isspace(static_cast<unsigned char>(*cursor)) && idx < (sizeof(token) - 1)) {
-    token[idx++] = *cursor++;
-  }
-  token[idx] = '\0';
-
-  if (token[0] == '\0') {
+  char commandText[kSerialCmdBufferSize] = {0};
+  if (!extractTelegramCommandText(text, commandText, sizeof(commandText))) {
     return;
   }
-  if (token[0] == '/') {
-    memmove(token, token + 1, strlen(token));
-  }
-  char* atPos = strchr(token, '@');
-  if (atPos != nullptr) {
-    *atPos = '\0';
-  }
-  for (size_t i = 0; token[i] != '\0'; ++i) {
-    token[i] = static_cast<char>(toupper(static_cast<unsigned char>(token[i])));
-  }
 
-  if (strcmp(token, "ESTADO") == 0 || strcmp(token, "STATUS") == 0) {
+  char normalizedCommand[kSerialCmdBufferSize] = {0};
+  snprintf(normalizedCommand, sizeof(normalizedCommand), "%s", commandText);
+  normalizeCommand(normalizedCommand);
+
+  if (strcmp(normalizedCommand, "ESTADO") == 0 || strcmp(normalizedCommand, "STATUS") == 0) {
     char statusMessage[320] = {0};
     buildStatusMessage(statusMessage, sizeof(statusMessage), nowMs);
     telegramSendMessage(statusMessage);
     return;
   }
 
-  if (strcmp(token, "HELP") == 0 || strcmp(token, "AYUDA") == 0 || strcmp(token, "START") == 0) {
-    telegramSendMessage("Comandos disponibles:\n- estado\n- help");
+  if (strcmp(normalizedCommand, "BAT") == 0 || strcmp(normalizedCommand, "BAT STATUS") == 0) {
+    char batteryMessage[192] = {0};
+    buildBatteryMessage(batteryMessage, sizeof(batteryMessage));
+    telegramSendMessage(batteryMessage);
     return;
   }
 
-  telegramSendMessage("Comando no reconocido. Usa: estado");
+  if (strcmp(normalizedCommand, "CURR") == 0 ||
+      strcmp(normalizedCommand, "CURR STATUS") == 0 ||
+      strcmp(normalizedCommand, "HALL") == 0 ||
+      strcmp(normalizedCommand, "HALL STATUS") == 0) {
+    char currentMessage[192] = {0};
+    buildCurrentMessage(currentMessage, sizeof(currentMessage));
+    telegramSendMessage(currentMessage);
+    return;
+  }
+
+  if (strcmp(normalizedCommand, "RTC") == 0 || strcmp(normalizedCommand, "RTC STATUS") == 0) {
+    char rtcMessage[64] = {0};
+    buildRtcMessage(rtcMessage, sizeof(rtcMessage));
+    telegramSendMessage(rtcMessage);
+    return;
+  }
+
+  if (strcmp(normalizedCommand, "ALERT") == 0 || strcmp(normalizedCommand, "ALERT STATUS") == 0) {
+    char alertMessage[128] = {0};
+    buildAlertMessage(alertMessage, sizeof(alertMessage));
+    telegramSendMessage(alertMessage);
+    return;
+  }
+
+  if (strcmp(normalizedCommand, "HELP") == 0 ||
+      strcmp(normalizedCommand, "AYUDA") == 0 ||
+      strcmp(normalizedCommand, "START") == 0) {
+    char helpMessage[192] = {0};
+    buildTelegramHelpMessage(helpMessage, sizeof(helpMessage));
+    telegramSendMessage(helpMessage);
+    return;
+  }
+
+  if (startsWithCommand(normalizedCommand, "CMD")) {
+    const char* innerCommand = commandText + 3;
+    while (*innerCommand != '\0' && isspace(static_cast<unsigned char>(*innerCommand))) {
+      ++innerCommand;
+    }
+    handleTelegramConsoleCommand(innerCommand, nowMs);
+    return;
+  }
+
+  if (isTelegramConsoleCommand(normalizedCommand)) {
+    handleTelegramConsoleCommand(commandText, nowMs);
+    return;
+  }
+
+  telegramSendMessage("Comando no reconocido. Usa /help.");
 }
 
 void pollTelegramCommands(uint32_t nowMs) {
@@ -688,9 +934,13 @@ void maybeSendStartupTelegram(uint32_t nowMs) {
   if (gTelegramStartupSent || !telegramEnabled()) {
     return;
   }
-  if (WiFi.status() != WL_CONNECTED || !appBridge.mqttConnected()) {
+  if (WiFi.status() != WL_CONNECTED) {
     return;
   }
+  if (nowMs - gLastTelegramStartupAttemptMs < kTelegramStartupRetryMs) {
+    return;
+  }
+  gLastTelegramStartupAttemptMs = nowMs;
 
   char statusMessage[320] = {0};
   char startupMessage[352] = {0};
@@ -997,8 +1247,12 @@ void printCommandHelp() {
   Serial.println("  ALERT TEST LOST");
   Serial.println("  ALERT TEST RESTORE");
   Serial.println("Telegram bot:");
-  Serial.println("  estado / status");
-  Serial.println("  help");
+  Serial.println("  /estado | /status");
+  Serial.println("  /bat | /curr | /rtc | /alert");
+  Serial.println("  /cmd CURR ZERO");
+  Serial.println("  /cmd CURR CAL 4.2");
+  Serial.println("  /cmd BAT CAL 12.60");
+  Serial.println("  /help");
 }
 
 void normalizeCommand(char* text) {
@@ -1532,8 +1786,8 @@ void loop() {
   const uint32_t nowMs = millis();
 
   appBridge.update(nowMs);
-  maybeSendStartupTelegram(nowMs);
   pollTelegramCommands(nowMs);
+  maybeSendStartupTelegram(nowMs);
   handleSerialCommands();
   batteryMonitor.update(nowMs);
   hallCurrentMonitor.update(nowMs);
